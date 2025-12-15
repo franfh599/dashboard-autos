@@ -6,7 +6,6 @@ import calendar
 import os
 import numpy as np
 from fpdf import FPDF
-import tempfile
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(
@@ -26,7 +25,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- MOTOR DE REPORTE PDF (NUEVO) ---
+# --- MOTOR DE REPORTE PDF (BLINDADO) ---
 class PDF(FPDF):
     def header(self):
         self.set_font('Arial', 'B', 15)
@@ -38,6 +37,13 @@ class PDF(FPDF):
         self.set_font('Arial', 'I', 8)
         self.cell(0, 10, f'Pagina {self.page_no()}', 0, 0, 'C')
 
+def clean_text(text):
+    """Limpia el texto para evitar errores de caracteres raros (emojis/chinos) en el PDF"""
+    try:
+        return str(text).encode('latin-1', 'replace').decode('latin-1')
+    except:
+        return str(text)
+
 def generar_pdf_nativo(df_filtrado, titulo_reporte):
     pdf = PDF()
     pdf.add_page()
@@ -45,7 +51,8 @@ def generar_pdf_nativo(df_filtrado, titulo_reporte):
     
     # 1. Título y Resumen
     pdf.set_font("Arial", 'B', 14)
-    pdf.cell(0, 10, f"Analisis: {titulo_reporte}", 0, 1, 'L')
+    # Usamos clean_text para asegurar que el título no rompa el PDF
+    pdf.cell(0, 10, f"Analisis: {clean_text(titulo_reporte)}", 0, 1, 'L')
     pdf.ln(5)
     
     # KPIs Generales
@@ -70,7 +77,7 @@ def generar_pdf_nativo(df_filtrado, titulo_reporte):
     pdf.cell(50, 10, "Unidades", 1, 1, 'C', 1)
     
     for marca, cant in top_marcas.items():
-        pdf.cell(100, 10, str(marca), 1)
+        pdf.cell(100, 10, clean_text(marca), 1)
         pdf.cell(50, 10, f"{cant:,.0f}", 1, 1, 'R')
     pdf.ln(10)
 
@@ -99,8 +106,8 @@ def generar_pdf_nativo(df_filtrado, titulo_reporte):
     top_gris = df_filtrado[df_filtrado['TIPO']=='GRIS'].groupby('EMPRESA')['CANTIDAD'].sum().sort_values(ascending=False).head(5)
     
     for emp, cant in top_gris.items():
-        # Limpiar nombre empresa para evitar error de caracteres raros
-        emp_clean = str(emp).encode('latin-1', 'replace').decode('latin-1')[:40] 
+        # Limpieza agresiva de nombre de empresa
+        emp_clean = clean_text(str(emp))[:40] 
         pdf.set_font("Arial", '', 9)
         pdf.cell(140, 8, f"- {emp_clean}", 0, 0)
         pdf.cell(30, 8, f"{cant:,.0f} unds", 0, 1, 'R')
@@ -181,7 +188,6 @@ if df is not None:
             chk_mk = st.checkbox("Todas las Marcas", value=True)
             mks = mks_all if chk_mk else st.multiselect("Marcas", mks_all, default=mks_all[:3])
             
-            # Botón de Descarga PDF (AQUÍ ESTÁ LA MAGIA)
             st.divider()
             st.markdown("### 📥 Descargas")
             
@@ -189,11 +195,10 @@ if df is not None:
         
         # --- GENERACIÓN DEL PDF EN TIEMPO REAL ---
         if not df_f.empty:
-            # Generamos el PDF en memoria
-            pdf_bytes = generar_pdf_nativo(df_f, "Comparativo Global")
-            
             # Ponemos el botón en el sidebar
             with st.sidebar:
+                # Generamos el PDF usando la función blindada
+                pdf_bytes = generar_pdf_nativo(df_f, "Comparativo Global")
                 st.download_button(
                     label="📄 Descargar Reporte PDF",
                     data=pdf_bytes,
@@ -249,6 +254,7 @@ if df is not None:
             st.divider()
             # Botón de Descarga PDF para esta vista
             if not df_d.empty:
+                # Usamos la función blindada
                 pdf_bytes_d = generar_pdf_nativo(df_d, f"Detalle {m} ({y})")
                 st.download_button(label="📄 Descargar Reporte PDF", data=pdf_bytes_d, file_name=f"Reporte_{m}_{y}.pdf", mime="application/pdf")
 
