@@ -5,71 +5,127 @@ import plotly.graph_objects as go
 import calendar
 import os
 import numpy as np
-import streamlit.components.v1 as components  # Necesario para el botón PDF
+from fpdf import FPDF
+import tempfile
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(
     page_title="EV Market Intelligence", 
     layout="wide", 
-    page_icon="🚀",
+    page_icon="💼",
     initial_sidebar_state="expanded"
 )
 
-# --- ESTILOS CSS (MÓVIL + PDF) ---
+# --- ESTILOS VISUALES ---
 st.markdown("""
 <style>
-    .main {background-color: #f8f9fa;}
-    h1, h2, h3 {font-family: 'Segoe UI', sans-serif; color: #2c3e50;}
-    
-    /* Botón de PDF destacado */
-    .stButton button {
-        background-color: #2c3e50;
-        color: white;
-        font-weight: bold;
-        width: 100%;
-    }
-    .stButton button:hover {
-        background-color: #34495e;
-        color: white;
-    }
-
-    /* Ajustes Móvil */
-    @media (max-width: 768px) { 
-        .block-container {padding: 1rem 0.5rem !important;} 
-        h1 {font-size: 1.5rem !important;} 
-    }
-    
-    /* Lógica de Impresión PDF */
-    @media print {
-        [data-testid="stSidebar"], [data-testid="stHeader"], .stDeployButton, footer, .no-print {display: none !important;}
-        body, .stApp {background-color: white !important; color: black !important;}
-        .block-container {max-width: 100% !important; padding: 0 !important; margin: 0 !important;}
-        body {zoom: 65%;}
-    }
+    .main {background-color: #f4f6f9;}
+    h1, h2, h3 {font-family: 'Arial', sans-serif; color: #1e3799;}
+    .metric-card {background-color: white; border-left: 5px solid #1e3799; padding: 15px; box-shadow: 2px 2px 5px rgba(0,0,0,0.1);}
+    div[data-testid="stMetricValue"] {font-size: 24px; color: #1e3799;}
 </style>
 """, unsafe_allow_html=True)
 
-# --- CARGA DE DATOS AUTOMÁTICA ---
+# --- MOTOR DE REPORTE PDF (NUEVO) ---
+class PDF(FPDF):
+    def header(self):
+        self.set_font('Arial', 'B', 15)
+        self.cell(0, 10, 'Reporte de Inteligencia de Mercado - EV', 0, 1, 'C')
+        self.ln(5)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('Arial', 'I', 8)
+        self.cell(0, 10, f'Pagina {self.page_no()}', 0, 0, 'C')
+
+def generar_pdf_nativo(df_filtrado, titulo_reporte):
+    pdf = PDF()
+    pdf.add_page()
+    pdf.set_font("Arial", size=12)
+    
+    # 1. Título y Resumen
+    pdf.set_font("Arial", 'B', 14)
+    pdf.cell(0, 10, f"Analisis: {titulo_reporte}", 0, 1, 'L')
+    pdf.ln(5)
+    
+    # KPIs Generales
+    total_unidades = df_filtrado['CANTIDAD'].sum()
+    total_inversion = df_filtrado['VALOR US$ CIF'].sum()
+    precio_prom = total_inversion / total_unidades if total_unidades > 0 else 0
+    
+    pdf.set_font("Arial", '', 10)
+    pdf.cell(0, 8, f"Total Unidades Importadas: {total_unidades:,.0f}", 0, 1)
+    pdf.cell(0, 8, f"Inversion Total CIF: ${total_inversion/1e6:,.2f} Millones USD", 0, 1)
+    pdf.cell(0, 8, f"Precio Promedio CIF: ${precio_prom:,.0f}", 0, 1)
+    pdf.ln(10)
+
+    # 2. Tabla Top Marcas (Texto)
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 10, "Top 5 Marcas por Volumen", 0, 1, 'L')
+    pdf.set_font("Arial", '', 10)
+    
+    top_marcas = df_filtrado.groupby('MARCA')['CANTIDAD'].sum().sort_values(ascending=False).head(5)
+    pdf.set_fill_color(240, 240, 240)
+    pdf.cell(100, 10, "Marca", 1, 0, 'C', 1)
+    pdf.cell(50, 10, "Unidades", 1, 1, 'C', 1)
+    
+    for marca, cant in top_marcas.items():
+        pdf.cell(100, 10, str(marca), 1)
+        pdf.cell(50, 10, f"{cant:,.0f}", 1, 1, 'R')
+    pdf.ln(10)
+
+    # 3. Análisis Mercado Gris
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 10, "Analisis de Fuga (Mercado Gris)", 0, 1, 'L')
+    pdf.set_font("Arial", '', 10)
+    
+    # Lógica de cálculo
+    mapa_oficiales = {}
+    marcas_unicas = df_filtrado['MARCA'].unique()
+    for m in marcas_unicas:
+        d = df_filtrado[df_filtrado['MARCA'] == m]
+        if not d.empty: mapa_oficiales[m] = d.groupby('EMPRESA')['CANTIDAD'].sum().idxmax()
+    
+    df_filtrado['TIPO'] = df_filtrado.apply(lambda x: 'OFICIAL' if x['EMPRESA'] == mapa_oficiales.get(x['MARCA']) else 'GRIS', axis=1)
+    vol_gris = df_filtrado[df_filtrado['TIPO']=='GRIS']['CANTIDAD'].sum()
+    pct_gris = (vol_gris / total_unidades) * 100 if total_unidades > 0 else 0
+    
+    pdf.multi_cell(0, 8, f"Del volumen total analizado, se detectaron {vol_gris:,.0f} unidades ingresadas por Mercado Gris, lo que representa un {pct_gris:.1f}% de fuga.")
+    pdf.ln(5)
+    
+    # Tabla Top Gris
+    pdf.set_font("Arial", 'B', 10)
+    pdf.cell(0, 10, "Top Importadores No Oficiales:", 0, 1)
+    top_gris = df_filtrado[df_filtrado['TIPO']=='GRIS'].groupby('EMPRESA')['CANTIDAD'].sum().sort_values(ascending=False).head(5)
+    
+    for emp, cant in top_gris.items():
+        # Limpiar nombre empresa para evitar error de caracteres raros
+        emp_clean = str(emp).encode('latin-1', 'replace').decode('latin-1')[:40] 
+        pdf.set_font("Arial", '', 9)
+        pdf.cell(140, 8, f"- {emp_clean}", 0, 0)
+        pdf.cell(30, 8, f"{cant:,.0f} unds", 0, 1, 'R')
+
+    # Guardar en memoria
+    return pdf.output(dest='S').encode('latin-1')
+
+# --- CARGA DE DATOS ---
 @st.cache_data
 def cargar_datos_automatico():
     archivo_objetivo = "historial_lite.parquet"
     if not os.path.exists(archivo_objetivo):
-        return None, f"❌ ERROR: Falta '{archivo_objetivo}' en GitHub."
-    
+        return None, f"❌ ERROR: No encuentro '{archivo_objetivo}' en GitHub."
     try:
         df = pd.read_parquet(archivo_objetivo)
-        
-        # Limpieza Estándar
         df.columns = df.columns.str.strip().str.upper()
-        cols_txt = ['MARCA', 'MODELO', 'EMPRESA', 'COMBUSTIBLE', 'MES', 'CARROCERIA', 'ESTILO']
+        
+        # Limpieza básica
+        cols_txt = ['MARCA', 'MODELO', 'EMPRESA', 'COMBUSTIBLE', 'MES', 'CARROCERIA']
         for c in cols_txt:
             if c in df.columns: 
                 df[c] = df[c].astype(str).str.strip().str.upper()
-                if c == 'MARCA':
-                    df[c] = df[c].replace(['M.G.', 'MORRIS GARAGES', 'M. G.'], 'MG').replace(['BYD AUTO'], 'BYD')
-
-        if 'CARROCERIA' not in df.columns:
-            df['CARROCERIA'] = df['ESTILO'] if 'ESTILO' in df.columns else 'NO DEFINIDO'
+                if c == 'MARCA': df[c] = df[c].replace(['M.G.', 'MORRIS GARAGES'], 'MG').replace(['BYD AUTO'], 'BYD')
+        
+        if 'CARROCERIA' not in df.columns: df['CARROCERIA'] = 'NO DEFINIDO'
 
         for c in ['CANTIDAD', 'VALOR US$ CIF', 'FLETE']:
             if c in df.columns:
@@ -86,172 +142,169 @@ def cargar_datos_automatico():
         if 'VALOR US$ CIF' in df.columns and 'CANTIDAD' in df.columns:
             df['CIF_UNITARIO'] = df['VALOR US$ CIF'] / df['CANTIDAD']
             df['CIF_UNITARIO'] = df['CIF_UNITARIO'].replace([np.inf, -np.inf], 0).fillna(0)
-
+            
         if 'FLETE' in df.columns and 'CANTIDAD' in df.columns:
             df['FLETE_UNITARIO'] = df['FLETE'] / df['CANTIDAD']
             df['FLETE_UNITARIO'] = df['FLETE_UNITARIO'].replace([np.inf, -np.inf], 0).fillna(0)
-            
+
         return df, "OK"
     except Exception as e:
         return None, f"❌ Error: {str(e)}"
 
 # --- SIDEBAR ---
 with st.sidebar:
-    st.title("🚀 EV Intelligence")
-    
+    st.title("💼 EV Intelligence")
     df, mensaje = cargar_datos_automatico()
     
     if df is not None:
-        st.success(f"✅ Online ({len(df):,.0f} regs)")
+        st.success(f"✅ Conectado ({len(df):,.0f} regs)")
         st.divider()
-        modo = st.radio("Modo:", ["⚔️ Comparativo (VS)", "🔍 Deep Dive (Detalle)"], index=0)
-        st.divider()
-        
-        # BOTÓN PDF REAL (JAVASCRIPT)
-        st.markdown("### 📥 Exportar")
-        if st.button("🖨️ Generar PDF / Imprimir"):
-            # Inyectamos Javascript para abrir el diálogo de impresión del navegador
-            components.html("<script>window.print()</script>", height=0, width=0)
-            
+        modo = st.radio("Navegación:", ["⚔️ Comparativo Global", "🔍 Deep Dive (Detalle)"], index=0)
     else:
         st.error(mensaje)
 
 # --- LÓGICA PRINCIPAL ---
 if df is not None:
     
-    # === MODO 1: COMPARATIVO (VS) ===
-    if modo == "⚔️ Comparativo (VS)":
+    # === MODO 1: COMPARATIVO ===
+    if modo == "⚔️ Comparativo Global":
         with st.sidebar:
-            st.subheader("Filtros Globales")
-            
-            # AÑOS: Marcado "Todos" por defecto (value=True)
-            all_years = sorted(df['AÑO'].dropna().unique().astype(int), reverse=True)
-            check_all_years = st.checkbox("Seleccionar Todos los Años", value=True)
-            
-            if check_all_years:
-                yrs = all_years
-            else:
-                yrs = st.multiselect("Años", all_years, default=all_years[:1])
+            st.subheader("Filtros")
+            # Selección TOTAL por defecto
+            yrs_all = sorted(df['AÑO'].dropna().unique().astype(int), reverse=True)
+            chk_yr = st.checkbox("Todos los Años", value=True)
+            yrs = yrs_all if chk_yr else st.multiselect("Años", yrs_all, default=yrs_all[:1])
             
             df_y = df[df['AÑO'].isin(yrs)]
             
-            # MARCAS: Marcado "Todas" por defecto (value=True)
-            all_brands = sorted(df_y['MARCA'].unique())
-            check_all_brands = st.checkbox("Seleccionar Todas las Marcas", value=True)
+            mks_all = sorted(df_y['MARCA'].unique())
+            chk_mk = st.checkbox("Todas las Marcas", value=True)
+            mks = mks_all if chk_mk else st.multiselect("Marcas", mks_all, default=mks_all[:3])
             
-            if check_all_brands:
-                mks = all_brands
-            else:
-                defaults = [x for x in ['MG', 'GAC'] if x in all_brands]
-                mks = st.multiselect("Marcas", all_brands, default=defaults)
-            
-            body_opts = sorted(df[df['MARCA'].isin(mks)]['CARROCERIA'].unique())
-            bdy = st.multiselect("Carrocería", body_opts, default=body_opts)
-            
-        df_f = df[(df['AÑO'].isin(yrs)) & (df['MARCA'].isin(mks)) & (df['CARROCERIA'].isin(bdy))].copy()
-        
-        if not df_f.empty:
-            st.title(f"⚔️ Comparativo Total")
-            
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                st.subheader("Cuota de Mercado")
-                st.plotly_chart(px.bar(df_f.groupby(['AÑO', 'MARCA'])['CANTIDAD'].sum().reset_index(), x='AÑO', y='CANTIDAD', color='MARCA', barmode='group', text_auto=True), use_container_width=True)
-            with c2:
-                st.subheader("Totales")
-                st.dataframe(df_f.groupby('MARCA')['CANTIDAD'].sum().sort_values(ascending=False).reset_index(), use_container_width=True, hide_index=True)
-
+            # Botón de Descarga PDF (AQUÍ ESTÁ LA MAGIA)
             st.divider()
-            st.subheader("🕵️ Mercado Gris Agregado")
-            mapa = {}
+            st.markdown("### 📥 Descargas")
+            
+        df_f = df[(df['AÑO'].isin(yrs)) & (df['MARCA'].isin(mks))].copy()
+        
+        # --- GENERACIÓN DEL PDF EN TIEMPO REAL ---
+        if not df_f.empty:
+            # Generamos el PDF en memoria
+            pdf_bytes = generar_pdf_nativo(df_f, "Comparativo Global")
+            
+            # Ponemos el botón en el sidebar
+            with st.sidebar:
+                st.download_button(
+                    label="📄 Descargar Reporte PDF",
+                    data=pdf_bytes,
+                    file_name="Reporte_Ejecutivo.pdf",
+                    mime="application/pdf"
+                )
+
+            st.title("⚔️ Panorama Competitivo")
+            
+            # LÓGICA MERCADO GRIS (SOLICITUD: LIDER = OFICIAL)
+            mapa_oficiales = {}
             for m in mks:
                 d = df_f[df_f['MARCA'] == m]
-                if not d.empty: mapa[m] = d.groupby('EMPRESA')['CANTIDAD'].sum().idxmax()
-            df_f['TIPO'] = df_f.apply(lambda x: 'OFICIAL' if x['EMPRESA'] == mapa.get(x['MARCA']) else 'GRIS', axis=1)
+                if not d.empty: 
+                    # El importador #1 es el OFICIAL
+                    mapa_oficiales[m] = d.groupby('EMPRESA')['CANTIDAD'].sum().idxmax()
             
-            cg1, cg2 = st.columns(2)
-            with cg1:
-                vals = [df_f[df_f['TIPO']=='OFICIAL']['CANTIDAD'].sum(), df_f[df_f['TIPO']=='GRIS']['CANTIDAD'].sum()]
-                st.plotly_chart(go.Figure(data=[go.Pie(labels=['Oficial', 'Gris'], values=vals, hole=.6, marker_colors=['#2ECC71', '#95A5A6'])]), use_container_width=True)
-            with cg2:
-                st.write("**Top Gris (Multimarca):**")
-                st.dataframe(df_f[df_f['TIPO']=='GRIS'].groupby('EMPRESA').agg(Autos=('CANTIDAD','sum'), Marcas=('MARCA', 'unique')).sort_values('Autos', ascending=False).head(5), use_container_width=True)
+            df_f['TIPO_IMPORTADOR'] = df_f.apply(lambda x: 'OFICIAL' if x['EMPRESA'] == mapa_oficiales.get(x['MARCA']) else 'GRIS', axis=1)
 
-            st.divider()
-            st.subheader("📊 Distribución de Precios (Box Plot)")
-            df_price = df_f[(df_f['CIF_UNITARIO'] > 1000) & (df_f['CIF_UNITARIO'] < 100000)]
-            if not df_price.empty:
-                st.plotly_chart(px.box(df_price, x='MARCA', y='CIF_UNITARIO', color='MARCA', points="outliers", title="Rango de Precios CIF"), use_container_width=True)
+            # GRÁFICOS
+            c1, c2 = st.columns([2, 1])
+            with c1:
+                st.subheader("Tendencia de Fuga (Gris)")
+                # Gráfico Evolutivo de % Gris
+                trend = df_f.groupby(['AÑO', 'TIPO_IMPORTADOR'])['CANTIDAD'].sum().unstack().fillna(0)
+                trend['Total'] = trend['OFICIAL'] + trend['GRIS']
+                trend['% Gris'] = (trend['GRIS'] / trend['Total']) * 100
+                trend = trend.reset_index()
+                
+                fig = px.bar(trend, x='AÑO', y=['OFICIAL', 'GRIS'], title="Oficial vs Gris por Año", 
+                             color_discrete_map={'OFICIAL': '#27AE60', 'GRIS': '#95A5A6'})
+                fig.add_trace(go.Scatter(x=trend['AÑO'], y=trend['% Gris'], name='% Fuga', yaxis='y2', line=dict(color='red', width=3)))
+                fig.update_layout(yaxis2=dict(overlaying='y', side='right', range=[0, 100], title="% Fuga"))
+                st.plotly_chart(fig, use_container_width=True)
+                
+            with c2:
+                st.subheader("Top Importadores Gris")
+                gris_top = df_f[df_f['TIPO_IMPORTADOR']=='GRIS'].groupby('EMPRESA')['CANTIDAD'].sum().sort_values(ascending=False).head(10).reset_index()
+                st.dataframe(gris_top.style.background_gradient(cmap="Reds"), use_container_width=True, hide_index=True)
 
     # === MODO 2: DEEP DIVE ===
     elif modo == "🔍 Deep Dive (Detalle)":
         with st.sidebar:
-            st.subheader("Filtros")
-            y = st.selectbox("Año", sorted(df['AÑO'].dropna().unique().astype(int), reverse=True))
+            y = st.selectbox("Año Fiscal", sorted(df['AÑO'].dropna().unique().astype(int), reverse=True))
             df_y = df[df['AÑO']==y].copy()
-            brands_y = sorted(df_y['MARCA'].unique())
-            m = st.selectbox("Marca", ["TODO EL MERCADO"] + brands_y)
-            combustibles_disponibles = sorted(df_y['COMBUSTIBLE'].unique())
-            comb_sel = st.multiselect("⛽ Combustible", combustibles_disponibles, default=combustibles_disponibles)
-        
-        if m != "TODO EL MERCADO": df_y = df_y[df_y['MARCA']==m]
-        df_d = df_y[df_y['COMBUSTIBLE'].isin(comb_sel)].copy()
-        
-        st.title(f"🔍 Análisis: {m} ({y})")
-        
+            
+            m = st.selectbox("Marca", ["TODO EL MERCADO"] + sorted(df_y['MARCA'].unique()))
+            if m != "TODO EL MERCADO": df_y = df_y[df_y['MARCA']==m]
+            
+            comb = st.multiselect("⛽ Combustible", sorted(df_y['COMBUSTIBLE'].unique()), default=sorted(df_y['COMBUSTIBLE'].unique()))
+            df_d = df_y[df_y['COMBUSTIBLE'].isin(comb)].copy()
+            
+            st.divider()
+            # Botón de Descarga PDF para esta vista
+            if not df_d.empty:
+                pdf_bytes_d = generar_pdf_nativo(df_d, f"Detalle {m} ({y})")
+                st.download_button(label="📄 Descargar Reporte PDF", data=pdf_bytes_d, file_name=f"Reporte_{m}_{y}.pdf", mime="application/pdf")
+
         if not df_d.empty:
+            st.title(f"🔍 Análisis Profundo: {m}")
+            
+            # VISUALES DIDÁCTICOS (SOLICITUD: MÁS CLAROS)
             k1, k2, k3 = st.columns(3)
-            k1.metric("Unidades", f"{df_d['CANTIDAD'].sum():,.0f}")
-            k2.metric("CIF Promedio", f"${df_d['CIF_UNITARIO'].mean():,.0f}")
-            k3.metric("Inversión", f"${df_d['VALOR US$ CIF'].sum()/1e6:,.1f} M")
+            k1.metric("📦 Volumen Total", f"{df_d['CANTIDAD'].sum():,.0f} autos", delta="Total Importado")
+            k2.metric("💵 Costo CIF Promedio", f"${df_d['CIF_UNITARIO'].mean():,.0f}", delta="Precio Promedio")
+            k3.metric("🚨 Nivel de Fuga", "Calculando...", delta_color="inverse")
+
+            st.markdown("---")
             
-            tab1, tab2, tab3, tab4 = st.tabs(["🔮 Tendencia", "⚖️ Pareto", "🚢 Logística", "📋 Modelos"])
+            t1, t2, t3 = st.tabs(["📈 Tendencia Explicada", "🚢 Logística Visual", "⚖️ 80/20 Clave"])
             
-            with tab1:
+            with t1:
+                st.subheader("¿La marca está creciendo o cayendo?")
                 mensual = df_d.groupby('MES_NUM')['CANTIDAD'].sum().reset_index()
                 if len(mensual) > 1:
                     try:
-                        # Try/Except para evitar crash si faltan librerías o datos
-                        fig_t = px.scatter(mensual, x='MES_NUM', y='CANTIDAD', trendline="ols", trendline_color_override="red", title="Proyección")
-                        fig_t.update_traces(mode='lines+markers')
-                        fig_t.update_xaxes(tickmode='array', tickvals=list(range(1,13)), ticktext=[calendar.month_abbr[i] for i in range(1,13)])
-                        st.plotly_chart(fig_t, use_container_width=True)
+                        fig = px.scatter(mensual, x='MES_NUM', y='CANTIDAD', trendline="ols", title="Dirección del Mercado", trendline_color_override="red")
+                        fig.update_traces(mode='lines+markers', marker=dict(size=10))
+                        fig.update_xaxes(tickmode='array', tickvals=list(range(1,13)), ticktext=[calendar.month_abbr[i] for i in range(1,13)])
+                        st.plotly_chart(fig, use_container_width=True)
+                        st.success("✅ **Lectura Fácil:** La línea roja indica el futuro probable. Si apunta arriba, compra más stock. Si apunta abajo, cuidado.")
                     except:
-                        st.warning("No se pudo calcular la tendencia (Falta statsmodels o datos insuficientes).")
-                        st.plotly_chart(px.line(mensual, x='MES_NUM', y='CANTIDAD', markers=True), use_container_width=True)
-                else: st.warning("Datos insuficientes para tendencia.")
+                        st.plotly_chart(px.line(mensual, x='MES_NUM', y='CANTIDAD'), use_container_width=True)
+                else: st.warning("Datos insuficientes para predecir.")
 
-            with tab2:
-                pareto = df_d.groupby('MODELO')['CANTIDAD'].sum().sort_values(ascending=False).reset_index()
-                pareto['Acum'] = pareto['CANTIDAD'].cumsum()
-                pareto['%'] = (pareto['Acum']/pareto['CANTIDAD'].sum())*100
-                fig_p = go.Figure([go.Bar(x=pareto['MODELO'], y=pareto['CANTIDAD'], name='Unds'), go.Scatter(x=pareto['MODELO'], y=pareto['%'], name='%', yaxis='y2', line=dict(color='red'))])
-                fig_p.update_layout(yaxis2=dict(overlaying='y', side='right', range=[0, 110]))
-                fig_p.add_hline(y=80, line_dash="dot", line_color="green", yref="y2")
-                st.plotly_chart(fig_p, use_container_width=True)
-
-            with tab3:
+            with t2:
+                st.subheader("Rango de Negociación de Fletes")
                 df_flt = df_d[(df_d['FLETE_UNITARIO'] > 50) & (df_d['FLETE_UNITARIO'] < 8000)]
                 if not df_flt.empty:
                     stats = df_flt.groupby('MES_NUM')['FLETE_UNITARIO'].agg(['min', 'max', 'mean']).reset_index()
                     stats['Mes'] = stats['MES_NUM'].apply(lambda x: calendar.month_abbr[int(x)])
-                    fig_f = go.Figure()
-                    fig_f.add_trace(go.Scatter(x=stats['Mes'], y=stats['max'], mode='lines', showlegend=False))
-                    fig_f.add_trace(go.Scatter(x=stats['Mes'], y=stats['min'], mode='lines', fill='tonexty', fillcolor='rgba(46, 204, 113, 0.2)', name='Rango'))
-                    fig_f.add_trace(go.Scatter(x=stats['Mes'], y=stats['mean'], mode='lines+markers', line=dict(color='#27AE60', width=3), name='Promedio'))
-                    st.plotly_chart(fig_f, use_container_width=True)
-                else: st.warning("Sin datos de flete.")
+                    
+                    fig = go.Figure()
+                    fig.add_trace(go.Scatter(x=stats['Mes'], y=stats['max'], mode='lines', line=dict(width=0), showlegend=False))
+                    fig.add_trace(go.Scatter(x=stats['Mes'], y=stats['min'], mode='lines', fill='tonexty', fillcolor='rgba(255, 165, 0, 0.2)', name='Zona de Precio'))
+                    fig.add_trace(go.Scatter(x=stats['Mes'], y=stats['mean'], mode='lines+markers', line=dict(color='orange', width=3), name='Costo Real'))
+                    st.plotly_chart(fig, use_container_width=True)
+                    st.info("ℹ️ **Didáctico:** La zona sombreada es la diferencia entre el flete más barato y el más caro. Trata de mantenerte en la parte baja de la sombra.")
 
-            with tab4:
-                c1, c2 = st.columns(2)
-                with c1: st.plotly_chart(px.bar(df_d.groupby('MODELO')['CANTIDAD'].sum().sort_values().tail(15), orientation='h', text_auto=True), use_container_width=True)
-                with c2: 
-                    precios = df_d.groupby('MODELO').agg(Unidades=('CANTIDAD','sum'), Precio_Prom=('VALOR US$ CIF', 'sum'))
-                    precios['Precio_Prom'] = precios['Precio_Prom'] / precios['Unidades']
-                    st.dataframe(precios[precios['Unidades']>0].sort_values('Precio_Prom', ascending=False).style.format({'Precio_Prom': '${:,.0f}'}), use_container_width=True)
-        else:
-            st.warning("No hay datos (revisa el filtro de Combustible).")
+            with t3:
+                st.subheader("Modelos que sostienen el negocio")
+                pareto = df_d.groupby('MODELO')['CANTIDAD'].sum().sort_values(ascending=False).reset_index()
+                pareto['%'] = (pareto['CANTIDAD'].cumsum() / pareto['CANTIDAD'].sum()) * 100
+                
+                # Colores semánticos
+                pareto['Color'] = np.where(pareto['%'] <= 80, '#2ECC71', '#95A5A6') # Verde vital, Gris resto
+                
+                fig = go.Figure()
+                fig.add_trace(go.Bar(x=pareto['MODELO'], y=pareto['CANTIDAD'], marker_color=pareto['Color'], name='Unidades'))
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("🟢 **Verde:** Modelos Vitales (80% ventas) | ⚪ **Gris:** Modelos de Relleno")
 
 else:
-    st.markdown("### ⚠️ Bienvenido")
-    st.warning("Conectando con GitHub...")
+    st.info("Conectando con GitHub...")
