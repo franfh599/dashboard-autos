@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 import calendar
 import os
 import numpy as np
+import streamlit.components.v1 as components  # Necesario para el botón PDF
 
 # --- CONFIGURACIÓN DE PÁGINA ---
 st.set_page_config(
@@ -14,12 +15,31 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- ESTILOS CSS ---
+# --- ESTILOS CSS (MÓVIL + PDF) ---
 st.markdown("""
 <style>
     .main {background-color: #f8f9fa;}
     h1, h2, h3 {font-family: 'Segoe UI', sans-serif; color: #2c3e50;}
-    @media (max-width: 768px) { .block-container {padding: 1rem 0.5rem !important;} h1 {font-size: 1.5rem !important;} }
+    
+    /* Botón de PDF destacado */
+    .stButton button {
+        background-color: #2c3e50;
+        color: white;
+        font-weight: bold;
+        width: 100%;
+    }
+    .stButton button:hover {
+        background-color: #34495e;
+        color: white;
+    }
+
+    /* Ajustes Móvil */
+    @media (max-width: 768px) { 
+        .block-container {padding: 1rem 0.5rem !important;} 
+        h1 {font-size: 1.5rem !important;} 
+    }
+    
+    /* Lógica de Impresión PDF */
     @media print {
         [data-testid="stSidebar"], [data-testid="stHeader"], .stDeployButton, footer, .no-print {display: none !important;}
         body, .stApp {background-color: white !important; color: black !important;}
@@ -33,19 +53,14 @@ st.markdown("""
 @st.cache_data
 def cargar_datos_automatico():
     archivo_objetivo = "historial_lite.parquet"
-    
-    # 1. Verificar si el archivo existe
     if not os.path.exists(archivo_objetivo):
-        return None, f"❌ ERROR CRÍTICO: No encuentro el archivo '{archivo_objetivo}' en el servidor."
+        return None, f"❌ ERROR: Falta '{archivo_objetivo}' en GitHub."
     
     try:
-        # 2. Intentar leerlo
         df = pd.read_parquet(archivo_objetivo)
         
-        # 3. Limpieza y Cálculos (Blindaje)
+        # Limpieza Estándar
         df.columns = df.columns.str.strip().str.upper()
-        
-        # Normalizar textos
         cols_txt = ['MARCA', 'MODELO', 'EMPRESA', 'COMBUSTIBLE', 'MES', 'CARROCERIA', 'ESTILO']
         for c in cols_txt:
             if c in df.columns: 
@@ -56,7 +71,6 @@ def cargar_datos_automatico():
         if 'CARROCERIA' not in df.columns:
             df['CARROCERIA'] = df['ESTILO'] if 'ESTILO' in df.columns else 'NO DEFINIDO'
 
-        # Normalizar números
         for c in ['CANTIDAD', 'VALOR US$ CIF', 'FLETE']:
             if c in df.columns:
                 if df[c].dtype == 'object':
@@ -64,13 +78,11 @@ def cargar_datos_automatico():
                 else:
                     df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
         
-        # Fechas
         if 'FECHA' in df.columns:
             df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce')
             df['AÑO'] = df['FECHA'].dt.year
             df['MES_NUM'] = df['FECHA'].dt.month
         
-        # Unitarios
         if 'VALOR US$ CIF' in df.columns and 'CANTIDAD' in df.columns:
             df['CIF_UNITARIO'] = df['VALOR US$ CIF'] / df['CANTIDAD']
             df['CIF_UNITARIO'] = df['CIF_UNITARIO'].replace([np.inf, -np.inf], 0).fillna(0)
@@ -80,32 +92,29 @@ def cargar_datos_automatico():
             df['FLETE_UNITARIO'] = df['FLETE_UNITARIO'].replace([np.inf, -np.inf], 0).fillna(0)
             
         return df, "OK"
-        
     except Exception as e:
-        return None, f"❌ Error leyendo el archivo Parquet: {str(e)}"
+        return None, f"❌ Error: {str(e)}"
 
-# --- SIDEBAR LIMPIO (SIN UPLOAD) ---
+# --- SIDEBAR ---
 with st.sidebar:
     st.title("🚀 EV Intelligence")
     
-    # Intentamos cargar datos directos
     df, mensaje = cargar_datos_automatico()
     
     if df is not None:
-        st.success(f"✅ Conectado: {len(df):,.0f} registros")
+        st.success(f"✅ Online ({len(df):,.0f} regs)")
         st.divider()
         modo = st.radio("Modo:", ["⚔️ Comparativo (VS)", "🔍 Deep Dive (Detalle)"], index=0)
         st.divider()
+        
+        # BOTÓN PDF REAL (JAVASCRIPT)
+        st.markdown("### 📥 Exportar")
+        if st.button("🖨️ Generar PDF / Imprimir"):
+            # Inyectamos Javascript para abrir el diálogo de impresión del navegador
+            components.html("<script>window.print()</script>", height=0, width=0)
+            
     else:
-        st.error("⚠️ Sistema Desconectado")
-        # DEBUGGER VISIBLE: Para que veas qué pasa en la nube
-        st.warning(mensaje)
-        st.markdown("**Archivos detectados en la carpeta:**")
-        try:
-            archivos_en_servidor = os.listdir()
-            st.code("\n".join(archivos_en_servidor))
-        except:
-            st.write("No se pudo leer el directorio.")
+        st.error(mensaje)
 
 # --- LÓGICA PRINCIPAL ---
 if df is not None:
@@ -114,19 +123,26 @@ if df is not None:
     if modo == "⚔️ Comparativo (VS)":
         with st.sidebar:
             st.subheader("Filtros Globales")
+            
+            # AÑOS: Marcado "Todos" por defecto (value=True)
             all_years = sorted(df['AÑO'].dropna().unique().astype(int), reverse=True)
-            check_all_years = st.checkbox("Seleccionar Todos los Años")
-            if check_all_years: yrs = all_years
-            else: yrs = st.multiselect("Años", all_years, default=all_years[:2])
+            check_all_years = st.checkbox("Seleccionar Todos los Años", value=True)
+            
+            if check_all_years:
+                yrs = all_years
+            else:
+                yrs = st.multiselect("Años", all_years, default=all_years[:1])
             
             df_y = df[df['AÑO'].isin(yrs)]
             
+            # MARCAS: Marcado "Todas" por defecto (value=True)
             all_brands = sorted(df_y['MARCA'].unique())
-            check_all_brands = st.checkbox("Seleccionar Todas las Marcas")
-            if check_all_brands: mks = all_brands
+            check_all_brands = st.checkbox("Seleccionar Todas las Marcas", value=True)
+            
+            if check_all_brands:
+                mks = all_brands
             else:
-                defaults = [x for x in ['MG', 'GAC', 'AION'] if x in all_brands]
-                if not defaults and all_brands: defaults = [all_brands[0]]
+                defaults = [x for x in ['MG', 'GAC'] if x in all_brands]
                 mks = st.multiselect("Marcas", all_brands, default=defaults)
             
             body_opts = sorted(df[df['MARCA'].isin(mks)]['CARROCERIA'].unique())
@@ -135,9 +151,8 @@ if df is not None:
         df_f = df[(df['AÑO'].isin(yrs)) & (df['MARCA'].isin(mks)) & (df['CARROCERIA'].isin(bdy))].copy()
         
         if not df_f.empty:
-            st.title(f"⚔️ Comparativo: {len(mks)} Marcas")
-            st.info("🖨️ PDF: Ctrl+P")
-
+            st.title(f"⚔️ Comparativo Total")
+            
             c1, c2 = st.columns([2, 1])
             with c1:
                 st.subheader("Cuota de Mercado")
@@ -163,7 +178,7 @@ if df is not None:
                 st.dataframe(df_f[df_f['TIPO']=='GRIS'].groupby('EMPRESA').agg(Autos=('CANTIDAD','sum'), Marcas=('MARCA', 'unique')).sort_values('Autos', ascending=False).head(5), use_container_width=True)
 
             st.divider()
-            st.subheader("📊 Precios (Box Plot)")
+            st.subheader("📊 Distribución de Precios (Box Plot)")
             df_price = df_f[(df_f['CIF_UNITARIO'] > 1000) & (df_f['CIF_UNITARIO'] < 100000)]
             if not df_price.empty:
                 st.plotly_chart(px.box(df_price, x='MARCA', y='CIF_UNITARIO', color='MARCA', points="outliers", title="Rango de Precios CIF"), use_container_width=True)
@@ -195,10 +210,15 @@ if df is not None:
             with tab1:
                 mensual = df_d.groupby('MES_NUM')['CANTIDAD'].sum().reset_index()
                 if len(mensual) > 1:
-                    fig_t = px.scatter(mensual, x='MES_NUM', y='CANTIDAD', trendline="ols", trendline_color_override="red", title="Proyección")
-                    fig_t.update_traces(mode='lines+markers')
-                    fig_t.update_xaxes(tickmode='array', tickvals=list(range(1,13)), ticktext=[calendar.month_abbr[i] for i in range(1,13)])
-                    st.plotly_chart(fig_t, use_container_width=True)
+                    try:
+                        # Try/Except para evitar crash si faltan librerías o datos
+                        fig_t = px.scatter(mensual, x='MES_NUM', y='CANTIDAD', trendline="ols", trendline_color_override="red", title="Proyección")
+                        fig_t.update_traces(mode='lines+markers')
+                        fig_t.update_xaxes(tickmode='array', tickvals=list(range(1,13)), ticktext=[calendar.month_abbr[i] for i in range(1,13)])
+                        st.plotly_chart(fig_t, use_container_width=True)
+                    except:
+                        st.warning("No se pudo calcular la tendencia (Falta statsmodels o datos insuficientes).")
+                        st.plotly_chart(px.line(mensual, x='MES_NUM', y='CANTIDAD', markers=True), use_container_width=True)
                 else: st.warning("Datos insuficientes para tendencia.")
 
             with tab2:
@@ -229,8 +249,9 @@ if df is not None:
                     precios = df_d.groupby('MODELO').agg(Unidades=('CANTIDAD','sum'), Precio_Prom=('VALOR US$ CIF', 'sum'))
                     precios['Precio_Prom'] = precios['Precio_Prom'] / precios['Unidades']
                     st.dataframe(precios[precios['Unidades']>0].sort_values('Precio_Prom', ascending=False).style.format({'Precio_Prom': '${:,.0f}'}), use_container_width=True)
+        else:
+            st.warning("No hay datos (revisa el filtro de Combustible).")
 
 else:
-    # Mensaje elegante si falla la carga automática
-    st.markdown("### 📡 Conectando con Base de Datos...")
-    st.info("Si ves esto, el sistema está buscando el archivo 'historial_lite.parquet' en GitHub.")
+    st.markdown("### ⚠️ Bienvenido")
+    st.warning("Conectando con GitHub...")
