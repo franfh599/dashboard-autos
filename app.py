@@ -45,7 +45,7 @@ def clean_text(text):
 
 @st.cache_data(show_spinner=False)
 def generar_pdf_ejecutivo(df_dict, titulo, subtitulo):
-    # Reconstruimos DF ligero
+    # Reconstruimos DF ligero desde el diccionario
     df = pd.DataFrame(df_dict)
     
     pdf = PDF()
@@ -73,7 +73,6 @@ def generar_pdf_ejecutivo(df_dict, titulo, subtitulo):
     pdf.ln(15)
 
     # 3. TABLA DE LIDERAZGO (TOP 15)
-    # En lugar de imprimir todo, imprimimos solo el TOP 15 para ahorrar memoria
     pdf.set_font("Arial", 'B', 12)
     agrupador = 'MODELO' if 'MODELO' in df.columns else 'MARCA'
     pdf.cell(0, 10, f"Ranking Top 15 por {clean_text(agrupador)}", 0, 1)
@@ -172,7 +171,6 @@ if df is not None:
         c1, c2 = st.columns([2, 1])
         with c1:
             st.subheader("Tendencia")
-            # Agrupación segura para gráfica
             mensual = df_m.groupby(['AÑO', 'MES_NUM'])['CANTIDAD'].sum().reset_index()
             mensual['Fecha'] = pd.to_datetime(mensual['AÑO'].astype(str) + '-' + mensual['MES_NUM'].astype(str) + '-01')
             st.plotly_chart(px.line(mensual, x='Fecha', y='CANTIDAD', markers=True), use_container_width=True)
@@ -276,26 +274,27 @@ if df is not None:
         titulo_pdf = f"Reporte Detallado: {brand_dd} ({y_dd})"
 
     # ==============================================================================
-    # 4. BOTÓN DESCARGA PDF (EN SIDEBAR)
+    # 4. BOTÓN DESCARGA PDF (EN SIDEBAR - SOLUCIÓN DIRECTA)
     # ==============================================================================
     if 'pdf_data' in locals() and not pdf_data.empty:
         st.sidebar.divider()
         st.sidebar.markdown("### 📥 Exportar")
         
-        if st.sidebar.button("📄 Generar PDF Ejecutivo"):
-            try:
-                # Convertimos a Dict para el caché (Súper Rápido)
-                data_dict = pdf_data.to_dict(orient='list')
-                pdf_bytes = generar_pdf_ejecutivo(data_dict, titulo_pdf, f"Generado el {pd.Timestamp.now().date()}")
-                
-                st.sidebar.download_button(
-                    label="💾 Descargar Archivo",
-                    data=pdf_bytes,
-                    file_name="Reporte_Inteligencia.pdf",
-                    mime="application/pdf"
-                )
-            except Exception as e:
-                st.sidebar.error(f"Error generando PDF: {e}")
+        # SOLUCIÓN: Generamos el PDF automáticamente y mostramos SOLO el botón de descarga
+        # Esto evita el problema de anidar botones.
+        try:
+            # Convertimos a Dict para velocidad
+            data_dict = pdf_data.to_dict(orient='list')
+            pdf_bytes = generar_pdf_ejecutivo(data_dict, titulo_pdf, f"Generado el {pd.Timestamp.now().date()}")
+            
+            st.sidebar.download_button(
+                label="💾 Descargar PDF",
+                data=pdf_bytes,
+                file_name="Reporte_Inteligencia.pdf",
+                mime="application/pdf"
+            )
+        except Exception as e:
+            st.sidebar.error(f"Error PDF: {e}")
 
     # Limpiar RAM
     gc.collect()
