@@ -36,7 +36,6 @@ except ImportError:
 if PDF_AVAILABLE:
     class PDF(FPDF):
         def header(self):
-            # Usamos Helvetica que es estándar y no falla en Linux
             self.set_font('Helvetica', 'B', 15)
             self.cell(0, 10, 'Reporte de Inteligencia de Mercado - EV', 0, 1, 'C')
             self.ln(5)
@@ -235,7 +234,8 @@ if df is not None:
                 st.subheader("Top Gris")
                 if 'GRIS' in df_f['TIPO_IMPORTADOR'].unique():
                     gris_top = df_f[df_f['TIPO_IMPORTADOR']=='GRIS'].groupby('EMPRESA')['CANTIDAD'].sum().sort_values(ascending=False).head(10).reset_index()
-                    st.dataframe(gris_top.style.background_gradient(cmap="Reds"), use_container_width=True, hide_index=True)
+                    # CORRECCIÓN: Eliminamos .style.background_gradient para evitar error de matplotlib
+                    st.dataframe(gris_top, use_container_width=True, hide_index=True)
                 else:
                     st.success("No se detectó mercado gris relevante.")
 
