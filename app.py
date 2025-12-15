@@ -19,9 +19,7 @@ st.markdown("""
 <style>
     .main {background-color: #f8f9fa;}
     h1, h2, h3 {font-family: 'Segoe UI', sans-serif; color: #2c3e50;}
-    /* Ajustes Móvil */
     @media (max-width: 768px) { .block-container {padding: 1rem 0.5rem !important;} h1 {font-size: 1.5rem !important;} }
-    /* Ajustes Impresión PDF */
     @media print {
         [data-testid="stSidebar"], [data-testid="stHeader"], .stDeployButton, footer, .no-print {display: none !important;}
         body, .stApp {background-color: white !important; color: black !important;}
@@ -31,20 +29,23 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- CARGA DE DATOS ---
+# --- CARGA DE DATOS AUTOMÁTICA ---
 @st.cache_data
-def cargar_datos(source):
-    df = None
+def cargar_datos_automatico():
+    archivo_objetivo = "historial_lite.parquet"
+    
+    # 1. Verificar si el archivo existe
+    if not os.path.exists(archivo_objetivo):
+        return None, f"❌ ERROR CRÍTICO: No encuentro el archivo '{archivo_objetivo}' en el servidor."
+    
     try:
-        if isinstance(source, str) and source.endswith('.parquet'):
-            df = pd.read_parquet(source)
-        else:
-            try: df = pd.read_excel(source, sheet_name='2019-2025')
-            except: df = pd.read_excel(source)
-
-        if df is None: return None
-
+        # 2. Intentar leerlo
+        df = pd.read_parquet(archivo_objetivo)
+        
+        # 3. Limpieza y Cálculos (Blindaje)
         df.columns = df.columns.str.strip().str.upper()
+        
+        # Normalizar textos
         cols_txt = ['MARCA', 'MODELO', 'EMPRESA', 'COMBUSTIBLE', 'MES', 'CARROCERIA', 'ESTILO']
         for c in cols_txt:
             if c in df.columns: 
@@ -55,6 +56,7 @@ def cargar_datos(source):
         if 'CARROCERIA' not in df.columns:
             df['CARROCERIA'] = df['ESTILO'] if 'ESTILO' in df.columns else 'NO DEFINIDO'
 
+        # Normalizar números
         for c in ['CANTIDAD', 'VALOR US$ CIF', 'FLETE']:
             if c in df.columns:
                 if df[c].dtype == 'object':
@@ -62,12 +64,13 @@ def cargar_datos(source):
                 else:
                     df[c] = pd.to_numeric(df[c], errors='coerce').fillna(0)
         
+        # Fechas
         if 'FECHA' in df.columns:
             df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce')
             df['AÑO'] = df['FECHA'].dt.year
             df['MES_NUM'] = df['FECHA'].dt.month
         
-        # Cálculos Unitarios
+        # Unitarios
         if 'VALOR US$ CIF' in df.columns and 'CANTIDAD' in df.columns:
             df['CIF_UNITARIO'] = df['VALOR US$ CIF'] / df['CANTIDAD']
             df['CIF_UNITARIO'] = df['CIF_UNITARIO'].replace([np.inf, -np.inf], 0).fillna(0)
@@ -76,76 +79,65 @@ def cargar_datos(source):
             df['FLETE_UNITARIO'] = df['FLETE'] / df['CANTIDAD']
             df['FLETE_UNITARIO'] = df['FLETE_UNITARIO'].replace([np.inf, -np.inf], 0).fillna(0)
             
-        return df
-    except Exception:
-        return None
+        return df, "OK"
+        
+    except Exception as e:
+        return None, f"❌ Error leyendo el archivo Parquet: {str(e)}"
 
-# --- SIDEBAR ---
+# --- SIDEBAR LIMPIO (SIN UPLOAD) ---
 with st.sidebar:
     st.title("🚀 EV Intelligence")
-    archivo_local = "historial_lite.parquet"
-    uploaded_file = st.file_uploader("Actualizar Data", type=["xlsx"])
     
-    df = None
-    if uploaded_file:
-        df = cargar_datos(uploaded_file)
-        if df is not None: st.success("✅ Datos Subidos")
-    elif os.path.exists(archivo_local):
-        df = cargar_datos(archivo_local)
-        if df is not None: st.info("📂 Datos Precargados")
-    else:
-        st.warning("⚠️ Sin datos.")
-
+    # Intentamos cargar datos directos
+    df, mensaje = cargar_datos_automatico()
+    
     if df is not None:
+        st.success(f"✅ Conectado: {len(df):,.0f} registros")
         st.divider()
         modo = st.radio("Modo:", ["⚔️ Comparativo (VS)", "🔍 Deep Dive (Detalle)"], index=0)
         st.divider()
+    else:
+        st.error("⚠️ Sistema Desconectado")
+        # DEBUGGER VISIBLE: Para que veas qué pasa en la nube
+        st.warning(mensaje)
+        st.markdown("**Archivos detectados en la carpeta:**")
+        try:
+            archivos_en_servidor = os.listdir()
+            st.code("\n".join(archivos_en_servidor))
+        except:
+            st.write("No se pudo leer el directorio.")
 
 # --- LÓGICA PRINCIPAL ---
 if df is not None:
     
-    # ==========================================
-    # MODO 1: COMPARATIVO (VS)
-    # ==========================================
+    # === MODO 1: COMPARATIVO (VS) ===
     if modo == "⚔️ Comparativo (VS)":
         with st.sidebar:
             st.subheader("Filtros Globales")
-            
-            # 1. AÑOS (CON BOTÓN "TODOS")
             all_years = sorted(df['AÑO'].dropna().unique().astype(int), reverse=True)
             check_all_years = st.checkbox("Seleccionar Todos los Años")
-            if check_all_years:
-                yrs = all_years
-            else:
-                yrs = st.multiselect("Años", all_years, default=all_years[:2])
+            if check_all_years: yrs = all_years
+            else: yrs = st.multiselect("Años", all_years, default=all_years[:2])
             
-            # Filtrado parcial para obtener marcas disponibles
             df_y = df[df['AÑO'].isin(yrs)]
             
-            # 2. MARCAS (CON BOTÓN "TODAS")
             all_brands = sorted(df_y['MARCA'].unique())
             check_all_brands = st.checkbox("Seleccionar Todas las Marcas")
-            
-            if check_all_brands:
-                mks = all_brands
+            if check_all_brands: mks = all_brands
             else:
-                # Pre-selección inteligente
                 defaults = [x for x in ['MG', 'GAC', 'AION'] if x in all_brands]
                 if not defaults and all_brands: defaults = [all_brands[0]]
                 mks = st.multiselect("Marcas", all_brands, default=defaults)
             
-            # 3. CARROCERÍA
             body_opts = sorted(df[df['MARCA'].isin(mks)]['CARROCERIA'].unique())
             bdy = st.multiselect("Carrocería", body_opts, default=body_opts)
             
-        # Filtro final
         df_f = df[(df['AÑO'].isin(yrs)) & (df['MARCA'].isin(mks)) & (df['CARROCERIA'].isin(bdy))].copy()
         
         if not df_f.empty:
-            st.title(f"⚔️ Comparativo: {len(mks)} Marcas Seleccionadas")
+            st.title(f"⚔️ Comparativo: {len(mks)} Marcas")
             st.info("🖨️ PDF: Ctrl+P")
 
-            # 1. VOLUMEN
             c1, c2 = st.columns([2, 1])
             with c1:
                 st.subheader("Cuota de Mercado")
@@ -154,7 +146,6 @@ if df is not None:
                 st.subheader("Totales")
                 st.dataframe(df_f.groupby('MARCA')['CANTIDAD'].sum().sort_values(ascending=False).reset_index(), use_container_width=True, hide_index=True)
 
-            # 2. MERCADO GRIS
             st.divider()
             st.subheader("🕵️ Mercado Gris Agregado")
             mapa = {}
@@ -171,36 +162,24 @@ if df is not None:
                 st.write("**Top Gris (Multimarca):**")
                 st.dataframe(df_f[df_f['TIPO']=='GRIS'].groupby('EMPRESA').agg(Autos=('CANTIDAD','sum'), Marcas=('MARCA', 'unique')).sort_values('Autos', ascending=False).head(5), use_container_width=True)
 
-            # 3. PRECIOS (BOX PLOT)
             st.divider()
-            st.subheader("📊 Distribución de Precios (Box Plot)")
+            st.subheader("📊 Precios (Box Plot)")
             df_price = df_f[(df_f['CIF_UNITARIO'] > 1000) & (df_f['CIF_UNITARIO'] < 100000)]
             if not df_price.empty:
                 st.plotly_chart(px.box(df_price, x='MARCA', y='CIF_UNITARIO', color='MARCA', points="outliers", title="Rango de Precios CIF"), use_container_width=True)
-            else:
-                st.warning("No hay precios válidos para graficar.")
 
-    # ==========================================
-    # MODO 2: DEEP DIVE (DETALLE)
-    # ==========================================
+    # === MODO 2: DEEP DIVE ===
     elif modo == "🔍 Deep Dive (Detalle)":
         with st.sidebar:
-            st.subheader("Filtros de Profundidad")
+            st.subheader("Filtros")
             y = st.selectbox("Año", sorted(df['AÑO'].dropna().unique().astype(int), reverse=True))
-            
             df_y = df[df['AÑO']==y].copy()
             brands_y = sorted(df_y['MARCA'].unique())
             m = st.selectbox("Marca", ["TODO EL MERCADO"] + brands_y)
-            
-            # --- MEJORA: FILTRO COMBUSTIBLE ---
             combustibles_disponibles = sorted(df_y['COMBUSTIBLE'].unique())
             comb_sel = st.multiselect("⛽ Combustible", combustibles_disponibles, default=combustibles_disponibles)
         
-        # Aplicamos filtros
-        if m != "TODO EL MERCADO": 
-            df_y = df_y[df_y['MARCA']==m]
-        
-        # Filtro Combustible aplicado aquí
+        if m != "TODO EL MERCADO": df_y = df_y[df_y['MARCA']==m]
         df_d = df_y[df_y['COMBUSTIBLE'].isin(comb_sel)].copy()
         
         st.title(f"🔍 Análisis: {m} ({y})")
@@ -214,18 +193,15 @@ if df is not None:
             tab1, tab2, tab3, tab4 = st.tabs(["🔮 Tendencia", "⚖️ Pareto", "🚢 Logística", "📋 Modelos"])
             
             with tab1:
-                st.subheader("Tendencia Mensual")
                 mensual = df_d.groupby('MES_NUM')['CANTIDAD'].sum().reset_index()
                 if len(mensual) > 1:
                     fig_t = px.scatter(mensual, x='MES_NUM', y='CANTIDAD', trendline="ols", trendline_color_override="red", title="Proyección")
                     fig_t.update_traces(mode='lines+markers')
                     fig_t.update_xaxes(tickmode='array', tickvals=list(range(1,13)), ticktext=[calendar.month_abbr[i] for i in range(1,13)])
                     st.plotly_chart(fig_t, use_container_width=True)
-                else:
-                    st.warning("Insuficientes datos para tendencia.")
+                else: st.warning("Datos insuficientes para tendencia.")
 
             with tab2:
-                st.subheader("Pareto (80/20)")
                 pareto = df_d.groupby('MODELO')['CANTIDAD'].sum().sort_values(ascending=False).reset_index()
                 pareto['Acum'] = pareto['CANTIDAD'].cumsum()
                 pareto['%'] = (pareto['Acum']/pareto['CANTIDAD'].sum())*100
@@ -235,7 +211,6 @@ if df is not None:
                 st.plotly_chart(fig_p, use_container_width=True)
 
             with tab3:
-                st.subheader("Fletes")
                 df_flt = df_d[(df_d['FLETE_UNITARIO'] > 50) & (df_d['FLETE_UNITARIO'] < 8000)]
                 if not df_flt.empty:
                     stats = df_flt.groupby('MES_NUM')['FLETE_UNITARIO'].agg(['min', 'max', 'mean']).reset_index()
@@ -254,9 +229,8 @@ if df is not None:
                     precios = df_d.groupby('MODELO').agg(Unidades=('CANTIDAD','sum'), Precio_Prom=('VALOR US$ CIF', 'sum'))
                     precios['Precio_Prom'] = precios['Precio_Prom'] / precios['Unidades']
                     st.dataframe(precios[precios['Unidades']>0].sort_values('Precio_Prom', ascending=False).style.format({'Precio_Prom': '${:,.0f}'}), use_container_width=True)
-        else:
-            st.warning("No hay datos con los filtros seleccionados (revisa el Combustible).")
 
 else:
-    st.markdown("### ⚠️ Bienvenido")
-    st.warning("No se encontraron datos.")
+    # Mensaje elegante si falla la carga automática
+    st.markdown("### 📡 Conectando con Base de Datos...")
+    st.info("Si ves esto, el sistema está buscando el archivo 'historial_lite.parquet' en GitHub.")
