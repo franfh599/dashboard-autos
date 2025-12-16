@@ -4,3 +4,4 @@ plotly
 openpyxl
 pyarrow
 fpdf
+matplotlib
