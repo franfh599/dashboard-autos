@@ -1,808 +1,1160 @@
-import streamlit as st
+# -*- coding: utf-8 -*-
+"""
+EV Market Intelligence Suite | Streamlit App
+Robust, production-ready single-file app (~500–1000 lines).
+
+Notas de despliegue (Streamlit Cloud):
+- Preferible incluir el parquet en el repo o definir una URL en st.secrets:
+  DATA_URL = "https://.../historial_lite.parquet"
+- También soporta carga manual por el usuario (file_uploader).
+- Evita dependencias frágiles (p.ej. trendline OLS de Plotly) implementando regresión simple con NumPy.
+
+Requisitos sugeridos (ajusta tu requirements.txt):
+streamlit
+pandas
+plotly
+pyarrow
+fpdf
+numpy
+"""
+
+from __future__ import annotations
+
+import os
+import io
+import gc
+import re
+import math
+import time
+import json
+import calendar
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, date
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-import calendar
-import os
-import numpy as np
-import gc
-from datetime import datetime
+import streamlit as st
 from fpdf import FPDF
+from urllib.request import urlopen, Request
+
 
 # ==============================================================================
+# 0) PAGE CONFIG (must be first Streamlit command)
 # ==============================================================================
-# 1. ARQUITECTURA Y CONFIGURACIÓN DEL SISTEMA
-# ==============================================================================
-# ==============================================================================
-
-# Configuración inicial de la página con metadatos extendidos
 st.set_page_config(
-    page_title="EV Market Intelligence Suite | Enterprise", 
-    layout="wide", 
+    page_title="EV Market Intelligence Suite | Enterprise",
+    layout="wide",
     page_icon="🧠",
     initial_sidebar_state="expanded",
     menu_items={
-        'Get Help': 'https://www.streamlit.io',
-        'Report a bug': "mailto:soporte@tuempresa.com",
-        'About': "# Market Intelligence Suite v27.0\nHerramienta de análisis estratégico."
-    }
+        "Get Help": "https://www.streamlit.io",
+        "Report a bug": "mailto:soporte@tuempresa.com",
+        "About": "# Market Intelligence Suite\nHerramienta de análisis estratégico.",
+    },
 )
 
-# Inicialización segura de variables de estado (Session State)
-# Esto garantiza que la configuración del usuario no se pierda al recargar gráficos.
-if 'theme_mode' not in st.session_state:
-    st.session_state['theme_mode'] = 'System'
+# ==============================================================================
+# 1) CONSTANTS / CONFIG
+# ==============================================================================
+APP_VERSION = "v27.5 (robusto)"
+DEFAULT_LOCAL_PARQUET = "historial_lite.parquet"
 
-if 'time_view' not in st.session_state:
-    st.session_state['time_view'] = 'Full Year' # Opciones: Full Year, YTD
+# Session state canonical keys/values
+THEME_SYSTEM = "SYSTEM"
+THEME_DARK_FORCE = "DARK_FORCE"
+THEME_LIGHT_FORCE = "LIGHT_FORCE"
+
+TIME_FULL = "FULL"
+TIME_YTD = "YTD"
+
+TIME_VIEW_LABELS = {
+    "Full Year (Completo)": TIME_FULL,
+    "YTD (Year to Date)": TIME_YTD,
+}
+
+# Column canonicalization
+CANON_COLS = {
+    "FECHA": "FECHA",
+    "AÑO": "AÑO",
+    "ANO": "AÑO",
+    "ANIO": "AÑO",
+    "MES": "MES",
+    "MES_NUM": "MES_NUM",
+    "MARCA": "MARCA",
+    "MODELO": "MODELO",
+    "EMPRESA": "EMPRESA",
+    "COMBUSTIBLE": "COMBUSTIBLE",
+    "CARROCERIA": "CARROCERIA",
+    "CANTIDAD": "CANTIDAD",
+    "VALOR US$ CIF": "VALOR US$ CIF",
+    "VALOR USD CIF": "VALOR US$ CIF",
+    "VALOR_USD_CIF": "VALOR US$ CIF",
+    "CIF": "VALOR US$ CIF",
+    "FLETE": "FLETE",
+    "FLETE_USD": "FLETE",
+}
+
+TEXT_COLS = ["MARCA", "MODELO", "EMPRESA", "COMBUSTIBLE", "CARROCERIA", "MES"]
+NUM_COLS = ["CANTIDAD", "VALOR US$ CIF", "FLETE"]
+
+BRAND_FIXES = {
+    "M.G.": "MG",
+    "M. G.": "MG",
+    "MORRIS GARAGES": "MG",
+    "BYD AUTO": "BYD",
+    "TOYOTA MOTOR": "TOYOTA",
+    "MB": "MERCEDES-BENZ",
+}
+
+PRICE_BINS = [0, 15000, 25000, 40000, 70000, 1000000]
+PRICE_LABELS = [
+    "Económico (<15k)",
+    "Masivo (15-25k)",
+    "Medio (25-40k)",
+    "Premium (40-70k)",
+    "Lujo (>70k)",
+]
+
+# Business-safe ranges (avoid distorted plots by data errors)
+CIF_MIN_VALID = 2000
+CIF_MAX_VALID = 150000
+FLETE_MIN_VALID = 50
+FLETE_MAX_VALID = 8000
+
 
 # ==============================================================================
-# 2. SISTEMA DE DISEÑO AVANZADO (CSS INJECTION)
+# 2) STATE / UTILITIES
 # ==============================================================================
+def init_session_state() -> None:
+    if "theme_mode" not in st.session_state:
+        st.session_state["theme_mode"] = THEME_SYSTEM
 
-def inject_custom_css():
-    """
-    Inyecta estilos CSS avanzados para controlar la apariencia de la interfaz.
-    Maneja la lógica de modo Oscuro/Claro forzado y mejora la legibilidad
-    de las tarjetas de métricas (KPIs).
-    """
-    
-    # CSS Base: Define espaciados, bordes de pestañas y sombras.
+    if "time_view" not in st.session_state:
+        # CANONICAL value, not UI label (prevents rerun loops)
+        st.session_state["time_view"] = TIME_FULL
+
+    if "debug_mode" not in st.session_state:
+        st.session_state["debug_mode"] = False
+
+    if "data_source_mode" not in st.session_state:
+        st.session_state["data_source_mode"] = "AUTO"  # AUTO | UPLOAD | LOCAL | URL
+
+    if "data_url" not in st.session_state:
+        # Optional: set via st.secrets["DATA_URL"]
+        st.session_state["data_url"] = ""
+
+    if "last_error" not in st.session_state:
+        st.session_state["last_error"] = ""
+
+
+def safe_upper_str(x) -> str:
+    if x is None:
+        return ""
+    return str(x).strip().upper()
+
+
+def to_number_series(s: pd.Series) -> pd.Series:
+    # Robust numeric coercion: handles commas, currency symbols, whitespace.
+    # Example: "$12,345.67" -> 12345.67
+    s2 = s.astype(str).str.replace(r"[,$₡\s]", "", regex=True)
+    s2 = s2.str.replace(r"(?<=\d)\.(?=\d{3}\b)", "", regex=True)  # remove thousands dots (EU)
+    s2 = s2.str.replace(",", ".", regex=False)  # comma decimal
+    return pd.to_numeric(s2, errors="coerce").fillna(0)
+
+
+def month_abbr_es(m: int) -> str:
+    # calendar.month_abbr is English; quick ES mapping
+    es = {
+        1: "Ene", 2: "Feb", 3: "Mar", 4: "Abr", 5: "May", 6: "Jun",
+        7: "Jul", 8: "Ago", 9: "Sep", 10: "Oct", 11: "Nov", 12: "Dic",
+    }
+    return es.get(int(m), str(m))
+
+
+def human_money(x: float) -> str:
+    try:
+        if abs(x) >= 1e9:
+            return f"${x/1e9:,.2f} B"
+        if abs(x) >= 1e6:
+            return f"${x/1e6:,.2f} M"
+        return f"${x:,.0f}"
+    except Exception:
+        return str(x)
+
+
+def inject_custom_css() -> None:
     base_css = """
     <style>
-        /* Ajuste del contenedor principal para maximizar el espacio útil */
-        .block-container {
-            padding-top: 1.5rem; 
-            padding-bottom: 6rem;
-        }
-        
-        /* Estilización de Pestañas (Tabs) */
-        .stTabs [data-baseweb="tab-list"] {
-            gap: 8px;
-            border-bottom: 1px solid rgba(128, 128, 128, 0.2);
-            padding-bottom: 5px;
-        }
-        
-        .stTabs [data-baseweb="tab"] {
-            height: 45px;
-            white-space: pre-wrap;
-            border-radius: 6px 6px 0px 0px;
-            padding: 8px 16px;
-            font-size: 14px;
-            font-weight: 600;
-            transition: all 0.2s ease-in-out;
-        }
-        
-        /* Efecto Hover en Tabs */
-        .stTabs [data-baseweb="tab"]:hover {
-            background-color: rgba(128, 128, 128, 0.1);
-        }
-        
-        /* Tarjetas de Métricas (KPI Cards) con efecto de cristal */
-        div[data-testid="stMetric"] {
-            background-color: rgba(255, 255, 255, 0.03); 
-            border: 1px solid rgba(128, 128, 128, 0.15);
-            padding: 20px;
-            border-radius: 12px;
-            border-left: 5px solid #1e3799; /* Azul Corporativo */
-            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
-            transition: transform 0.2s, box-shadow 0.2s;
-        }
-        
-        div[data-testid="stMetric"]:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 15px rgba(0, 0, 0, 0.1);
-        }
-
-        /* Ajuste de Dataframes para ocupar ancho completo */
-        div[data-testid="stDataFrame"] {
-            width: 100%;
-        }
+      /* Better spacing and max width handling */
+      .block-container { padding-top: 1.2rem; padding-bottom: 2rem; }
+      div[data-testid="stMetricValue"] { font-size: 1.55rem; }
+      div[data-testid="stMetricDelta"] { font-size: 0.9rem; }
+      /* Make dataframe more readable */
+      .stDataFrame { border-radius: 8px; overflow: hidden; }
+      /* Sidebar polish */
+      section[data-testid="stSidebar"] { padding-top: 1rem; }
+      /* Headings spacing */
+      h1, h2, h3 { margin-top: 0.6rem; }
+      /* Buttons */
+      .stButton>button { border-radius: 10px; }
     </style>
     """
     st.markdown(base_css, unsafe_allow_html=True)
 
-    # Lógica de Forzado de Tema (Hack CSS seguro para inversión de colores)
-    if st.session_state['theme_mode'] == 'Dark Force':
-        st.markdown("""
+    # Optional forced theme (CSS hack). Keep minimal to avoid breaking Streamlit updates.
+    if st.session_state["theme_mode"] == THEME_DARK_FORCE:
+        dark_css = """
         <style>
-            .stApp {
-                background-color: #0e1117;
-                color: #e0e0e0;
-            }
-            /* Invertir tablas nativas si es necesario para contraste */
-            .stDataFrame { filter: invert(0); } 
-            
-            /* Ajuste de sidebar en modo oscuro */
-            section[data-testid="stSidebar"] {
-                background-color: #161b22;
-                border-right: 1px solid #30363d;
-            }
+          html, body, [data-testid="stAppViewContainer"] { background-color: #0e1117 !important; color: #e6e6e6 !important; }
+          [data-testid="stSidebar"] { background-color: #0b0f14 !important; }
+          .stMarkdown, .stText, .stCaption { color: #e6e6e6 !important; }
         </style>
-        """, unsafe_allow_html=True)
-        
-    elif st.session_state['theme_mode'] == 'Light Force':
-        st.markdown("""
+        """
+        st.markdown(dark_css, unsafe_allow_html=True)
+    elif st.session_state["theme_mode"] == THEME_LIGHT_FORCE:
+        light_css = """
         <style>
-            .stApp {
-                background-color: #ffffff;
-                color: #1a1a1a;
-            }
-            section[data-testid="stSidebar"] {
-                background-color: #f8f9fa;
-                border-right: 1px solid #dee2e6;
-            }
+          html, body, [data-testid="stAppViewContainer"] { background-color: #ffffff !important; color: #111111 !important; }
+          [data-testid="stSidebar"] { background-color: #f7f7f9 !important; }
         </style>
-        """, unsafe_allow_html=True)
+        """
+        st.markdown(light_css, unsafe_allow_html=True)
 
-# Ejecutar inyección de estilos al inicio
-inject_custom_css()
+
+def set_last_error(msg: str) -> None:
+    st.session_state["last_error"] = msg
+
+
+def render_debug_panel(df: Optional[pd.DataFrame], ultima_fecha: Optional[pd.Timestamp]) -> None:
+    with st.expander("🧪 Diagnóstico (debug)", expanded=False):
+        st.write("Versión:", APP_VERSION)
+        st.write("time_view:", st.session_state.get("time_view"))
+        st.write("theme_mode:", st.session_state.get("theme_mode"))
+        if ultima_fecha is not None:
+            st.write("Última fecha detectada:", str(ultima_fecha))
+        if df is not None:
+            st.write("Filas:", len(df), " | Columnas:", len(df.columns))
+            st.write("Columnas:", list(df.columns))
+        if st.session_state.get("last_error"):
+            st.error(st.session_state["last_error"])
+        if st.button("Limpiar cachés (cache_data)"):
+            st.cache_data.clear()
+            st.success("Cache limpiado. Recargando...")
+            st.rerun()
+
 
 # ==============================================================================
+# 3) DATA LAYER (ETL) - robust
 # ==============================================================================
-# 3. CAPA DE DATOS (ETL & INGENIERÍA DE CARACTERÍSTICAS)
-# ==============================================================================
-# ==============================================================================
+def _download_bytes(url: str, timeout: int = 30) -> bytes:
+    # Basic UA to avoid some blocks
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    with urlopen(req, timeout=timeout) as resp:
+        return resp.read()
+
 
 @st.cache_data(show_spinner=False)
-def cargar_datos_robusto():
-    """
-    EXTRACT, TRANSFORM, LOAD (ETL):
-    1. Carga el archivo Parquet de alto rendimiento.
-    2. Normaliza nombres de columnas y datos string.
-    3. Corrige tipos de datos numéricos.
-    4. Genera columnas derivadas (Unitarios, Fechas).
-    5. Maneja errores de archivo no encontrado.
-    
-    Returns:
-        DataFrame: Datos limpios.
-        Timestamp: La fecha más reciente encontrada en la base.
-    """
-    archivo_fuente = "historial_lite.parquet"
-    
-    # Validación de existencia del archivo
-    if not os.path.exists(archivo_fuente):
-        return None, None
-    
-    try:
-        # Carga optimizada
-        df = pd.read_parquet(archivo_fuente)
-        
-        # --- FASE 1: NORMALIZACIÓN DE TEXTO ---
-        df.columns = df.columns.str.strip().str.upper()
-        
-        columnas_texto = ['MARCA', 'MODELO', 'EMPRESA', 'COMBUSTIBLE', 'CARROCERIA', 'MES']
-        for col in columnas_texto:
-            if col in df.columns: 
-                df[col] = df[col].astype(str).str.strip().str.upper()
-        
-        # Diccionario de corrección de marcas (Data Cleaning)
-        correcciones_marcas = {
-            'M.G.': 'MG', 
-            'MORRIS GARAGES': 'MG', 
-            'M. G.': 'MG',
-            'BYD AUTO': 'BYD', 
-            'TOYOTA MOTOR': 'TOYOTA',
-            'MB': 'MERCEDES-BENZ'
-        }
-        if 'MARCA' in df.columns:
-            df['MARCA'] = df['MARCA'].replace(correcciones_marcas)
-            
-        # --- FASE 2: CONVERSIÓN NUMÉRICA ---
-        columnas_numericas = ['CANTIDAD', 'VALOR US$ CIF', 'FLETE']
-        for col in columnas_numericas:
-            if col in df.columns: 
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-                
-        # --- FASE 3: INGENIERÍA DE FECHAS ---
-        if 'FECHA' in df.columns:
-            df['FECHA'] = pd.to_datetime(df['FECHA'], errors='coerce')
-            # Eliminar filas huerfanas sin fecha
-            df = df.dropna(subset=['FECHA'])
-            
-            # Crear dimensiones temporales
-            df['AÑO'] = df['FECHA'].dt.year.astype(int)
-            df['MES_NUM'] = df['FECHA'].dt.month.astype(int)
-            
-            # Detectar última fecha real para reportes de status
-            ultima_fecha = df['FECHA'].max()
-        else:
-            # Fallback si no hay columna fecha
-            ultima_fecha = None
+def load_parquet_from_url(url: str) -> pd.DataFrame:
+    b = _download_bytes(url)
+    bio = io.BytesIO(b)
+    return pd.read_parquet(bio)
 
-        # --- FASE 4: KPIS DERIVADOS (UNITARIOS) ---
-        # Usamos np.where o replace para evitar divisiones por cero (infinito)
-        if 'VALOR US$ CIF' in df.columns and 'CANTIDAD' in df.columns:
-            df['CIF_UNITARIO'] = (df['VALOR US$ CIF'] / df['CANTIDAD']).replace([np.inf, -np.inf], 0).fillna(0)
-            
-        if 'FLETE' in df.columns and 'CANTIDAD' in df.columns:
-            df['FLETE_UNITARIO'] = (df['FLETE'] / df['CANTIDAD']).replace([np.inf, -np.inf], 0).fillna(0)
-            
-        return df, ultima_fecha
-        
-    except Exception as e:
-        # Log del error en consola para debugging
-        print(f"Error ETL: {e}")
-        st.error(f"Error crítico cargando la base de datos: {str(e)}")
-        return None, None
 
-def aplicar_logica_temporal(df, ultima_fecha):
-    """
-    Aplica el filtro de visión temporal seleccionado por el usuario.
-    
-    Lógica YTD (Year To Date):
-    Si la base de datos termina en Agosto 2024, el sistema recortará
-    automáticamente los datos de 2023, 2022, etc., para mostrar solo
-    hasta Agosto de cada año. Esto permite comparaciones "peras con peras".
-    """
-    if st.session_state['time_view'] == 'YTD (Year to Date)' and ultima_fecha:
-        mes_corte = ultima_fecha.month
-        # Filtramos para que todos los años terminen en el mes de corte actual
-        df_filtrado = df[df['MES_NUM'] <= mes_corte].copy()
-        return df_filtrado
-    
-    # Si es Full Year, devolvemos todo sin cortar
+@st.cache_data(show_spinner=False)
+def load_parquet_from_bytes(b: bytes) -> pd.DataFrame:
+    return pd.read_parquet(io.BytesIO(b))
+
+
+@st.cache_data(show_spinner=False)
+def load_parquet_from_local(path: str) -> pd.DataFrame:
+    return pd.read_parquet(path)
+
+
+def canonicalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Normalize: strip, upper, collapse spaces
+    df = df.copy()
+    df.columns = (
+        df.columns.astype(str)
+        .str.strip()
+        .str.replace(r"\s+", " ", regex=True)
+        .str.upper()
+    )
+
+    # Map aliases to canonical names
+    new_cols = []
+    for c in df.columns:
+        c2 = CANON_COLS.get(c, c)
+        new_cols.append(c2)
+    df.columns = new_cols
+
     return df
 
-# ==============================================================================
-# ==============================================================================
-# 4. MOTOR DE REPORTES PDF (CLASE FPDF OPTIMIZADA)
-# ==============================================================================
-# ==============================================================================
 
-class ReportePDF(FPDF):
-    """Clase extendida de FPDF para reportes corporativos"""
-    
+def ensure_required_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, List[str]]:
+    # Not all modules require all columns, but core columns should exist.
+    required = ["CANTIDAD", "VALOR US$ CIF", "FECHA", "MARCA"]
+    missing = [c for c in required if c not in df.columns]
+
+    # If FECHA missing but AÑO + MES exist, try to build FECHA
+    if "FECHA" in missing and ("AÑO" in df.columns) and ("MES_NUM" in df.columns):
+        try:
+            df = df.copy()
+            df["FECHA"] = pd.to_datetime(
+                df["AÑO"].astype(int).astype(str) + "-" + df["MES_NUM"].astype(int).astype(str) + "-01",
+                errors="coerce",
+            )
+            missing = [c for c in required if c not in df.columns]
+        except Exception:
+            pass
+
+    return df, missing
+
+
+def etl_clean(df: pd.DataFrame) -> Tuple[pd.DataFrame, Optional[pd.Timestamp]]:
+    df = canonicalize_columns(df)
+
+    # Text columns
+    for col in TEXT_COLS:
+        if col in df.columns:
+            df[col] = df[col].map(safe_upper_str)
+
+    # Brand cleaning
+    if "MARCA" in df.columns:
+        df["MARCA"] = df["MARCA"].replace(BRAND_FIXES)
+
+    # Numeric columns
+    for col in NUM_COLS:
+        if col in df.columns:
+            df[col] = to_number_series(df[col])
+
+    # Dates
+    ultima_fecha = None
+    if "FECHA" in df.columns:
+        df["FECHA"] = pd.to_datetime(df["FECHA"], errors="coerce")
+        df = df.dropna(subset=["FECHA"]).copy()
+        df["AÑO"] = df["FECHA"].dt.year.astype(int)
+        df["MES_NUM"] = df["FECHA"].dt.month.astype(int)
+        ultima_fecha = df["FECHA"].max()
+
+    # Derived KPIs
+    if "VALOR US$ CIF" in df.columns and "CANTIDAD" in df.columns:
+        denom = df["CANTIDAD"].replace(0, np.nan)
+        df["CIF_UNITARIO"] = (df["VALOR US$ CIF"] / denom).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    if "FLETE" in df.columns and "CANTIDAD" in df.columns:
+        denom = df["CANTIDAD"].replace(0, np.nan)
+        df["FLETE_UNITARIO"] = (df["FLETE"] / denom).replace([np.inf, -np.inf], np.nan).fillna(0)
+
+    # Quality guardrails
+    if "CANTIDAD" in df.columns:
+        df = df[df["CANTIDAD"] >= 0].copy()
+
+    return df, ultima_fecha
+
+
+def apply_time_view(df: pd.DataFrame, ultima_fecha: Optional[pd.Timestamp]) -> pd.DataFrame:
+    if st.session_state["time_view"] == TIME_YTD and ultima_fecha is not None:
+        mes_corte = int(ultima_fecha.month)
+        if "MES_NUM" in df.columns:
+            return df[df["MES_NUM"] <= mes_corte].copy()
+    return df
+
+
+def get_data_source_status(local_exists: bool, url_exists: bool) -> str:
+    if local_exists and url_exists:
+        return "LOCAL/URL disponibles"
+    if local_exists:
+        return "LOCAL disponible"
+    if url_exists:
+        return "URL disponible"
+    return "Sin fuente automática"
+
+
+def load_data_flow() -> Tuple[Optional[pd.DataFrame], Optional[pd.Timestamp], str]:
+    """
+    Unified data flow:
+    1) If user uploaded: use it.
+    2) Else if local parquet exists: use it.
+    3) Else if secrets/url set: download and use it.
+    4) Else return None.
+    """
+    # A) Uploaded file (preferred if local missing)
+    uploaded = st.session_state.get("uploaded_parquet")
+    if uploaded is not None:
+        try:
+            df0 = load_parquet_from_bytes(uploaded)
+            df, ultima = etl_clean(df0)
+            return df, ultima, "UPLOAD"
+        except Exception as e:
+            set_last_error(f"Error leyendo parquet cargado: {e}")
+            return None, None, "UPLOAD_ERROR"
+
+    # B) Local file
+    local_path = os.getenv("DATA_PATH", DEFAULT_LOCAL_PARQUET)
+    if os.path.exists(local_path):
+        try:
+            df0 = load_parquet_from_local(local_path)
+            df, ultima = etl_clean(df0)
+            return df, ultima, "LOCAL"
+        except Exception as e:
+            set_last_error(f"Error leyendo parquet local ({local_path}): {e}")
+            return None, None, "LOCAL_ERROR"
+
+    # C) URL (secrets or session)
+    url = ""
+    try:
+        url = st.secrets.get("DATA_URL", "")  # optional
+    except Exception:
+        url = ""
+    if not url:
+        url = st.session_state.get("data_url", "")
+
+    if url:
+        try:
+            df0 = load_parquet_from_url(url)
+            df, ultima = etl_clean(df0)
+            return df, ultima, "URL"
+        except Exception as e:
+            set_last_error(f"Error descargando/leyendo parquet URL: {e}")
+            return None, None, "URL_ERROR"
+
+    # D) No data
+    return None, None, "NO_DATA"
+
+
+# ==============================================================================
+# 4) PDF REPORTING (FPDF) - robust encoding
+# ==============================================================================
+class ExecutivePDF(FPDF):
     def header(self):
-        # Encabezado corporativo en cada página
-        self.set_font('Arial', 'B', 14)
-        self.set_text_color(30, 55, 153) # Azul oscuro
-        self.cell(0, 10, 'Reporte de Inteligencia de Mercado - Automotriz', 0, 1, 'C')
-        self.ln(5)
-        
-    def footer(self):
-        # Pie de página con numeración y fecha
-        self.set_y(-15)
-        self.set_font('Arial', 'I', 8)
-        self.set_text_color(128)
-        fecha_gen = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.cell(0, 10, f'Pag {self.page_no()} - Generado el {fecha_gen} | Confidencial', 0, 0, 'C')
+        self.set_font("Helvetica", "B", 13)
+        self.set_text_color(30, 55, 153)
+        self.cell(0, 8, "Reporte de Inteligencia de Mercado - Automotriz", 0, 1, "C")
+        self.ln(2)
 
-def limpiar_texto_pdf(text):
-    """
-    Sanitiza cadenas de texto para evitar errores de codificación latin-1 en FPDF.
-    Reemplaza caracteres no soportados.
-    """
-    try: 
-        return str(text).encode('latin-1', 'replace').decode('latin-1')
-    except: 
+    def footer(self):
+        self.set_y(-14)
+        self.set_font("Helvetica", "I", 8)
+        self.set_text_color(120)
+        fecha_gen = datetime.now().strftime("%Y-%m-%d %H:%M")
+        self.cell(0, 10, f"Pag {self.page_no()} | Generado {fecha_gen} | Confidencial", 0, 0, "C")
+
+
+def pdf_sanitize(text) -> str:
+    # FPDF classic expects latin-1, so we replace unsupported chars.
+    try:
+        return str(text).encode("latin-1", "replace").decode("latin-1")
+    except Exception:
         return str(text)
 
+
 @st.cache_data(show_spinner=False)
-def generar_pdf_master(df_dict, titulo, subtitulo, view_mode):
-    """
-    Generador Maestro de PDFs. Toma un diccionario de datos (para cacheabilidad),
-    y construye un reporte ejecutivo con resumen, tablas y rankings.
-    """
-    # Convertir dict a DataFrame (operación ligera)
+def build_pdf_bytes(df_dict: Dict[str, List], title: str, subtitle: str, view_mode: str) -> bytes:
     df = pd.DataFrame(df_dict)
-    
-    pdf = ReportePDF()
+
+    pdf = ExecutivePDF(orientation="P", unit="mm", format="A4")
     pdf.add_page()
-    
-    # 1. BLOQUE DE TÍTULO Y CONTEXTO
-    pdf.set_font("Arial", 'B', 16)
-    pdf.set_text_color(0) # Negro
-    pdf.cell(0, 10, limpiar_texto_pdf(titulo), 0, 1, 'L')
-    
-    pdf.set_font("Arial", 'I', 11)
-    pdf.set_text_color(100) # Gris
-    pdf.cell(0, 10, f"Vista Temporal: {limpiar_texto_pdf(view_mode)} | {limpiar_texto_pdf(subtitulo)}", 0, 1, 'L')
-    pdf.ln(5)
-    
-    # 2. BLOQUE DE RESUMEN EJECUTIVO (KPIs)
-    # Cálculos agregados
-    total_vol = df['CANTIDAD'].sum()
-    total_val = df['VALOR US$ CIF'].sum()
-    promedio = total_val / total_vol if total_vol else 0
-    
-    # Dibujar caja de fondo gris
+
+    # Title block
+    pdf.set_font("Helvetica", "B", 16)
+    pdf.set_text_color(0)
+    pdf.cell(0, 10, pdf_sanitize(title), 0, 1, "L")
+    pdf.set_font("Helvetica", "I", 10)
+    pdf.set_text_color(90)
+    pdf.cell(0, 7, pdf_sanitize(f"Vista Temporal: {view_mode} | {subtitle}"), 0, 1, "L")
+    pdf.ln(3)
+
+    # Executive KPIs box
+    total_vol = float(df["CANTIDAD"].sum()) if "CANTIDAD" in df.columns else 0.0
+    total_val = float(df["VALOR US$ CIF"].sum()) if "VALOR US$ CIF" in df.columns else 0.0
+    ticket = (total_val / total_vol) if total_vol else 0.0
+
     pdf.set_fill_color(245, 245, 245)
     pdf.set_draw_color(220, 220, 220)
-    pdf.rect(10, 45, 190, 25, 'FD')
-    
-    # Textos de KPIs
-    pdf.set_y(52)
-    pdf.set_font("Arial", 'B', 12)
+    pdf.rect(10, 40, 190, 20, "FD")
+
+    pdf.set_y(45)
+    pdf.set_font("Helvetica", "B", 11)
     pdf.set_text_color(0)
-    
-    # Distribución en 3 columnas
-    pdf.cell(63, 10, f"Volumen Total: {total_vol:,.0f}", 0, 0, 'C')
-    pdf.cell(63, 10, f"Inversion CIF: ${total_val/1e6:,.1f} M", 0, 0, 'C')
-    pdf.cell(63, 10, f"Ticket Prom: ${promedio:,.0f}", 0, 1, 'C')
-    pdf.ln(25)
+    pdf.cell(63, 8, pdf_sanitize(f"Volumen: {total_vol:,.0f}"), 0, 0, "C")
+    pdf.cell(63, 8, pdf_sanitize(f"Inversión: {human_money(total_val)}"), 0, 0, "C")
+    pdf.cell(63, 8, pdf_sanitize(f"Ticket: {human_money(ticket)}"), 0, 1, "C")
+    pdf.ln(10)
 
-    # 3. BLOQUE DE TABLA PRINCIPAL (TOP 15)
-    pdf.set_font("Arial", 'B', 13)
+    # Main ranking
+    pdf.set_font("Helvetica", "B", 12)
     pdf.set_text_color(30, 55, 153)
-    
-    # Determinar dinámicamente el agrupador más relevante
-    if 'MODELO' in df.columns and len(df['MODELO'].unique()) > 1:
-        agrupador = 'MODELO'
-    elif 'MARCA' in df.columns:
-        agrupador = 'MARCA'
-    else:
-        agrupador = 'AÑO'
 
-    pdf.cell(0, 10, f"Ranking Top 15 - Desglose por {limpiar_texto_pdf(agrupador)}", 0, 1)
-    pdf.ln(2)
-    
-    # Encabezados de Tabla
-    pdf.set_font("Arial", 'B', 10)
-    pdf.set_text_color(255) # Blanco
-    pdf.set_fill_color(44, 62, 80) # Azul oscuro fondo
-    
-    pdf.cell(140, 8, limpiar_texto_pdf(agrupador), 1, 0, 'L', 1)
-    pdf.cell(50, 8, "Volumen (Unds)", 1, 1, 'R', 1)
-    
-    # Cuerpo de Tabla
-    pdf.set_font("Arial", '', 10)
-    pdf.set_text_color(0) # Negro
-    
-    top_data = df.groupby(agrupador)['CANTIDAD'].sum().sort_values(ascending=False).head(15)
-    
-    fill = False # Alternancia de colores en filas
-    for nombre, val in top_data.items():
-        if fill: pdf.set_fill_color(240, 240, 240)
-        else: pdf.set_fill_color(255, 255, 255)
-        
-        pdf.cell(140, 8, limpiar_texto_pdf(str(nombre))[:60], 1, 0, 'L', fill)
-        pdf.cell(50, 8, f"{val:,.0f}", 1, 1, 'R', fill)
-        fill = not fill # Alternar
-        
-    pdf.ln(8)
-    
-    # 4. BLOQUE SECUNDARIO (IMPORTADORES)
-    # Solo se muestra si existen datos de la empresa importadora
-    if 'EMPRESA' in df.columns:
-        pdf.set_font("Arial", 'B', 13)
-        pdf.set_text_color(30, 55, 153)
-        pdf.cell(0, 10, "Top 5 Importadores Clave Detectados", 0, 1)
-        
-        pdf.set_font("Arial", '', 10)
+    if "MODELO" in df.columns and df["MODELO"].nunique() > 1:
+        group = "MODELO"
+    elif "MARCA" in df.columns:
+        group = "MARCA"
+    else:
+        group = "AÑO" if "AÑO" in df.columns else None
+
+    if group is not None and group in df.columns and "CANTIDAD" in df.columns:
+        pdf.cell(0, 8, pdf_sanitize(f"Top 15 por {group}"), 0, 1, "L")
+        pdf.ln(1)
+
+        top = df.groupby(group)["CANTIDAD"].sum().sort_values(ascending=False).head(15)
+
+        pdf.set_font("Helvetica", "B", 9)
+        pdf.set_text_color(255)
+        pdf.set_fill_color(44, 62, 80)
+        pdf.cell(140, 7, pdf_sanitize(group), 1, 0, "L", 1)
+        pdf.cell(50, 7, "Unidades", 1, 1, "R", 1)
+
+        pdf.set_font("Helvetica", "", 9)
         pdf.set_text_color(0)
-        
-        top_imp = df.groupby('EMPRESA')['CANTIDAD'].sum().sort_values(ascending=False).head(5)
-        for nombre, val in top_imp.items():
-            pdf.cell(140, 7, f"- {limpiar_texto_pdf(str(nombre))[:65]}", 0, 0, 'L')
-            pdf.cell(50, 7, f"{val:,.0f}", 0, 1, 'R')
-
-    return pdf.output(dest='S').encode('latin-1')
-
-# ==============================================================================
-# ==============================================================================
-# 5. INTERFAZ DE USUARIO (SIDEBAR & MAIN)
-# ==============================================================================
-# ==============================================================================
-
-# Carga inicial de datos
-df_raw, ultima_fecha_raw = cargar_datos_robusto()
-
-# --- BARRA LATERAL (CONTROL CENTER) ---
-with st.sidebar:
-    st.title("🧠 Market Suite")
-    st.caption("v26.0 | Enterprise Edition")
-    
-    if df_raw is not None:
-        # A. STATUS DE DATOS
-        st.success("✅ Conexión Establecida")
-        
-        if ultima_fecha_raw:
-            str_fecha = ultima_fecha_raw.strftime("%d-%b-%Y")
-            st.info(f"📅 **Data actualizada al:**\n\n{str_fecha}")
-        
-        st.divider()
-
-        # B. CONTROLES DE VISUALIZACIÓN
-        st.subheader("⚙️ Preferencias")
-        
-        # Selector de Tema
-        c_theme1, c_theme2 = st.columns(2)
-        with c_theme1:
-            if st.button("🌙 Dark", use_container_width=True): 
-                st.session_state['theme_mode'] = 'Dark Force'
-                st.rerun()
-        with c_theme2:
-            if st.button("☀️ Light", use_container_width=True): 
-                st.session_state['theme_mode'] = 'Light Force'
-                st.rerun()
-            
-        # Selector de Tiempo (Fundamental para análisis YoY)
-        st.markdown("**Visión Temporal:**")
-        time_mode = st.radio("Corte de Datos:", 
-                             ["Full Year (Completo)", "YTD (Year to Date)"], 
-                             index=0 if st.session_state['time_view']=='Full Year' else 1,
-                             label_visibility="collapsed")
-        
-        # Detectar cambio y recargar si es necesario
-        if time_mode != st.session_state['time_view']:
-            st.session_state['time_view'] = time_mode
-            st.rerun()
-        
-        st.divider()
-        
-        # C. NAVEGACIÓN PRINCIPAL
-        st.subheader("📍 Módulos")
-        menu = st.radio("Ir a:", 
-                        ["🌍 1. Visión País (Macro)", 
-                         "⚔️ 2. Guerra de Marcas (Benchmark)", 
-                         "🔍 3. Auditoría de Marca (Deep Dive)"], label_visibility="collapsed")
-        st.divider()
-        
+        alt = False
+        for name, val in top.items():
+            pdf.set_fill_color(240, 240, 240) if alt else pdf.set_fill_color(255, 255, 255)
+            pdf.cell(140, 7, pdf_sanitize(str(name))[:65], 1, 0, "L", alt)
+            pdf.cell(50, 7, pdf_sanitize(f"{val:,.0f}"), 1, 1, "R", alt)
+            alt = not alt
     else:
-        st.error("⚠️ Error Crítico: No se encuentra el archivo 'historial_lite.parquet'.")
-        st.stop()
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(0)
+        pdf.multi_cell(0, 6, pdf_sanitize("No hay columnas suficientes para construir un ranking (se requieren CANTIDAD y una dimensión)."))
+
+    # Importers block
+    if "EMPRESA" in df.columns and "CANTIDAD" in df.columns:
+        pdf.ln(6)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.set_text_color(30, 55, 153)
+        pdf.cell(0, 8, "Top 5 Importadores", 0, 1, "L")
+        top_imp = df.groupby("EMPRESA")["CANTIDAD"].sum().sort_values(ascending=False).head(5)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.set_text_color(0)
+        for name, val in top_imp.items():
+            pdf.cell(140, 6, pdf_sanitize(f"- {name}")[:80], 0, 0, "L")
+            pdf.cell(50, 6, pdf_sanitize(f"{val:,.0f}"), 0, 1, "R")
+
+    return pdf.output(dest="S").encode("latin-1")
+
 
 # ==============================================================================
-# 6. LÓGICA DE NEGOCIO POR MÓDULO
+# 5) ANALYTICS HELPERS (groupbys, yoy, regression)
 # ==============================================================================
+@st.cache_data(show_spinner=False)
+def agg_monthly(df: pd.DataFrame) -> pd.DataFrame:
+    m = df.groupby(["AÑO", "MES_NUM"])["CANTIDAD"].sum().reset_index()
+    m["Fecha"] = pd.to_datetime(m["AÑO"].astype(str) + "-" + m["MES_NUM"].astype(str) + "-01", errors="coerce")
+    return m.dropna(subset=["Fecha"])
 
-# Aplicar filtro temporal global
-df_main = aplicar_logica_temporal(df_raw, ultima_fecha_raw)
 
-# Variables contenedoras para la exportación PDF final
-pdf_dataset = pd.DataFrame()
-pdf_title = ""
+@st.cache_data(show_spinner=False)
+def top_share(df: pd.DataFrame, dim: str, top_n: int = 15) -> pd.DataFrame:
+    t = df.groupby(dim)["CANTIDAD"].sum().sort_values(ascending=False).head(top_n).reset_index()
+    denom = t["CANTIDAD"].sum()
+    t["Share"] = (t["CANTIDAD"] / denom * 100) if denom else 0
+    return t
 
-# ------------------------------------------------------------------------------
-# MÓDULO 1: VISIÓN PAÍS (MACROANALYSIS)
-# ------------------------------------------------------------------------------
-if menu == "🌍 1. Visión País (Macro)":
-    st.title(f"🌍 Visión País: {st.session_state['time_view']}")
-    st.markdown("Análisis macroeconómico de importaciones automotrices.")
-    
-    # Selector de Años
-    years_avail = sorted(df_main['AÑO'].unique(), reverse=True)
-    sel_years = st.multiselect("Periodo de Análisis", years_avail, default=years_avail[:2])
-    
-    # Filtrado Local
-    df_view = df_main[df_main['AÑO'].isin(sel_years)].copy()
-    
-    # --- SECCIÓN A: KPIS GENERALES ---
-    vol_actual = df_view['CANTIDAD'].sum()
-    val_actual = df_view['VALOR US$ CIF'].sum()
-    
-    with st.container():
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("Volumen Total", f"{vol_actual:,.0f}", delta="Unidades Importadas")
-        k2.metric("Inversión CIF", f"${val_actual/1e6:,.1f} M", delta="Millones USD")
-        k3.metric("Ticket Promedio", f"${(val_actual/vol_actual if vol_actual else 0):,.0f}", delta="Costo Unitario")
-        k4.metric("Marcas Activas", f"{df_view['MARCA'].nunique()}", delta="Competidores")
+
+def linear_regression_forecast(x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+    """
+    Returns (slope, intercept) of y = m*x + b using np.polyfit.
+    x should be numeric (e.g., 1..12).
+    """
+    if len(x) < 2 or np.all(y == y[0]):
+        return 0.0, float(y.mean()) if len(y) else 0.0
+    m, b = np.polyfit(x, y, 1)
+    return float(m), float(b)
+
+
+def yoy_table(df_main: pd.DataFrame, df_view: pd.DataFrame, dim_col: str, sel_years: List[int]) -> Optional[pd.DataFrame]:
+    if len(sel_years) < 2:
+        return None
+
+    curr_y = int(max(sel_years))
+    prev_y = int(curr_y - 1)
+
+    df_curr = df_view[df_view["AÑO"] == curr_y]
+    df_prev = df_main[df_main["AÑO"] == prev_y]
+
+    if df_curr.empty and df_prev.empty:
+        return None
+
+    grp_curr = df_curr.groupby(dim_col).agg(
+        Vol_Actual=("CANTIDAD", "sum"),
+        CIF_Actual=("VALOR US$ CIF", "sum"),
+    ).reset_index()
+
+    grp_prev = df_prev.groupby(dim_col).agg(
+        Vol_Prev=("CANTIDAD", "sum"),
+        CIF_Prev=("VALOR US$ CIF", "sum"),
+    ).reset_index()
+
+    if grp_curr["Vol_Actual"].sum() > 0:
+        grp_curr["Share_Actual"] = grp_curr["Vol_Actual"] / grp_curr["Vol_Actual"].sum() * 100
+    else:
+        grp_curr["Share_Actual"] = 0
+
+    if grp_prev["Vol_Prev"].sum() > 0:
+        grp_prev["Share_Prev"] = grp_prev["Vol_Prev"] / grp_prev["Vol_Prev"].sum() * 100
+    else:
+        grp_prev["Share_Prev"] = 0
+
+    out = pd.merge(grp_curr, grp_prev, on=dim_col, how="outer").fillna(0)
+    out["Δ Share (pp)"] = out["Share_Actual"] - out["Share_Prev"]
+    out["Δ Inversión ($)"] = out["CIF_Actual"] - out["CIF_Prev"]
+    out["Estado"] = np.where(out["Δ Share (pp)"] >= 0, "🟢 Ganó", "🔻 Perdió")
+    return out
+
+
+# ==============================================================================
+# 6) UI COMPONENTS
+# ==============================================================================
+def sidebar_controls(df_raw: Optional[pd.DataFrame], ultima_fecha: Optional[pd.Timestamp], source_mode: str) -> None:
+    with st.sidebar:
+        st.title("🧠 Market Suite")
+        st.caption(f"{APP_VERSION} | Enterprise Edition")
+
+        # Debug
+        st.session_state["debug_mode"] = st.toggle("Modo debug", value=st.session_state["debug_mode"])
+
+        st.divider()
+        st.subheader("📦 Datos")
+
+        # Offer upload always (useful if deploy lacks parquet)
+        up = st.file_uploader("Cargar historial_lite.parquet", type=["parquet"])
+        if up is not None:
+            st.session_state["uploaded_parquet"] = up.getvalue()
+            st.success("Parquet cargado. Recargando…")
+            st.rerun()
+
+        # URL input (optional)
+        st.session_state["data_url"] = st.text_input(
+            "DATA_URL (opcional)",
+            value=st.session_state.get("data_url", ""),
+            help="Si no hay archivo local, se intentará descargar el parquet desde esta URL.",
+        )
+
+        local_path = os.getenv("DATA_PATH", DEFAULT_LOCAL_PARQUET)
+        local_exists = os.path.exists(local_path)
+        url_exists = bool(st.secrets.get("DATA_URL", "") if hasattr(st, "secrets") else "") or bool(st.session_state.get("data_url"))
+
+        st.caption(f"Fuente detectada: {source_mode} | {get_data_source_status(local_exists, url_exists)}")
+        if df_raw is not None:
+            st.success("✅ Datos cargados")
+            if ultima_fecha is not None:
+                st.info(f"📅 Data actualizada al: {ultima_fecha.strftime('%d-%b-%Y')}")
+        else:
+            st.error("⚠️ No hay datos disponibles (local/url/upload).")
+
+        st.divider()
+        st.subheader("⚙️ Preferencias")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🌙 Dark", use_container_width=True):
+                st.session_state["theme_mode"] = THEME_DARK_FORCE
+                st.rerun()
+        with c2:
+            if st.button("☀️ Light", use_container_width=True):
+                st.session_state["theme_mode"] = THEME_LIGHT_FORCE
+                st.rerun()
+
+        # Time view (robust)
+        labels = list(TIME_VIEW_LABELS.keys())
+        current_label = next(k for k, v in TIME_VIEW_LABELS.items() if v == st.session_state["time_view"])
+        current_index = labels.index(current_label)
+
+        st.markdown("**Visión Temporal:**")
+        time_label = st.radio(
+            "Corte de Datos:",
+            labels,
+            index=current_index,
+            label_visibility="collapsed",
+        )
+        new_value = TIME_VIEW_LABELS[time_label]
+        if new_value != st.session_state["time_view"]:
+            st.session_state["time_view"] = new_value
+            st.rerun()
+
+        st.divider()
+        st.subheader("📍 Módulos")
+        menu = st.radio(
+            "Ir a:",
+            ["🌍 1. Visión País (Macro)", "⚔️ 2. Guerra de Marcas (Benchmark)", "🔍 3. Auditoría de Marca (Deep Dive)"],
+            label_visibility="collapsed",
+        )
+        st.session_state["menu"] = menu
+
+
+def kpi_row(kpis: List[Tuple[str, str, str]]) -> None:
+    cols = st.columns(len(kpis))
+    for c, (label, value, delta) in zip(cols, kpis):
+        c.metric(label, value, delta=delta)
+
+
+# ==============================================================================
+# 7) PAGES / MODULES
+# ==============================================================================
+def page_macro(df_main: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    st.title(f"🌍 Visión País: {TIME_FULL if st.session_state['time_view']==TIME_FULL else 'YTD'}")
+    st.caption("Análisis macro de importaciones automotrices.")
+
+    years_avail = sorted(df_main["AÑO"].unique(), reverse=True)
+    default_years = years_avail[:2] if len(years_avail) >= 2 else years_avail
+    sel_years = st.multiselect("Periodo de Análisis", years_avail, default=default_years)
+
+    if not sel_years:
+        st.warning("Selecciona al menos un año.")
+        return df_main.iloc[0:0].copy(), "Reporte Macro País"
+
+    df_view = df_main[df_main["AÑO"].isin(sel_years)].copy()
+    vol = float(df_view["CANTIDAD"].sum())
+    val = float(df_view["VALOR US$ CIF"].sum())
+    tkt = (val / vol) if vol else 0.0
+
+    kpi_row([
+        ("Volumen Total", f"{vol:,.0f}", "Unidades"),
+        ("Inversión CIF", human_money(val), "USD"),
+        ("Ticket Promedio", human_money(tkt), "CIF unitario"),
+        ("Marcas Activas", f"{df_view['MARCA'].nunique():,}", "Competidores"),
+    ])
 
     st.markdown("---")
-
-    # --- SECCIÓN B: GRÁFICOS ESTRATÉGICOS ---
     col_a, col_b = st.columns([2, 1])
-    
+
     with col_a:
-        st.subheader("📈 Ritmo de Importación (Serie de Tiempo)")
-        # Agrupación Mensual
-        mensual = df_view.groupby(['AÑO', 'MES_NUM'])['CANTIDAD'].sum().reset_index()
-        # Crear fecha artificial día 1 para que el eje X sea temporal
-        mensual['Fecha'] = pd.to_datetime(mensual['AÑO'].astype(str) + '-' + mensual['MES_NUM'].astype(str) + '-01')
-        
-        fig_line = px.line(mensual, x='Fecha', y='CANTIDAD', markers=True, color='AÑO', 
-                          labels={'CANTIDAD':'Unidades', 'Fecha':'Mes de Registro'})
-        fig_line.update_layout(xaxis_title=None, legend_title="Año Fiscal")
-        st.plotly_chart(fig_line, use_container_width=True)
-        
+        st.subheader("📈 Ritmo de Importación (Serie de tiempo)")
+        monthly = agg_monthly(df_view)
+        if monthly.empty:
+            st.info("Sin datos mensuales suficientes.")
+        else:
+            fig = px.line(
+                monthly,
+                x="Fecha",
+                y="CANTIDAD",
+                markers=True,
+                color="AÑO",
+                labels={"CANTIDAD": "Unidades", "Fecha": "Mes"},
+            )
+            fig.update_layout(xaxis_title=None, legend_title="Año")
+            st.plotly_chart(fig, use_container_width=True)
+
     with col_b:
         st.subheader("⚡ Mix Energético")
-        fig_pie = px.pie(df_view, values='CANTIDAD', names='COMBUSTIBLE', hole=0.4,
-                         color_discrete_sequence=px.colors.qualitative.Prism)
-        fig_pie.update_traces(textposition='inside', textinfo='percent+label')
-        st.plotly_chart(fig_pie, use_container_width=True)
+        if "COMBUSTIBLE" in df_view.columns and df_view["COMBUSTIBLE"].nunique() > 0:
+            fig = px.pie(
+                df_view,
+                values="CANTIDAD",
+                names="COMBUSTIBLE",
+                hole=0.4,
+                color_discrete_sequence=px.colors.qualitative.Prism,
+            )
+            fig.update_traces(textposition="inside", textinfo="percent+label")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("No hay columna COMBUSTIBLE o está vacía.")
 
     col_c, col_d = st.columns(2)
+
     with col_c:
         st.subheader("💰 Segmentación de Precios")
-        # Definición de rangos de precio (Bins)
-        bins = [0, 15000, 25000, 40000, 70000, 1000000]
-        labels = ['Económico (<15k)', 'Masivo (15-25k)', 'Medio (25-40k)', 'Premium (40-70k)', 'Lujo (>70k)']
-        
-        df_view['SEGMENTO'] = pd.cut(df_view['CIF_UNITARIO'], bins=bins, labels=labels)
-        seg = df_view.groupby('SEGMENTO', observed=True)['CANTIDAD'].sum().reset_index()
-        
-        fig_seg = px.bar(seg, x='CANTIDAD', y='SEGMENTO', orientation='h', color='SEGMENTO', text_auto=True)
-        fig_seg.update_layout(showlegend=False, xaxis_title="Unidades")
-        st.plotly_chart(fig_seg, use_container_width=True)
+        if "CIF_UNITARIO" not in df_view.columns:
+            st.info("No se pudo calcular CIF_UNITARIO.")
+        else:
+            df_seg = df_view.copy()
+            df_seg["SEGMENTO"] = pd.cut(df_seg["CIF_UNITARIO"], bins=PRICE_BINS, labels=PRICE_LABELS)
+            seg = df_seg.groupby("SEGMENTO", observed=True)["CANTIDAD"].sum().reset_index()
+            if seg.empty:
+                st.info("Sin datos para segmentación.")
+            else:
+                fig = px.bar(seg, x="CANTIDAD", y="SEGMENTO", orientation="h", color="SEGMENTO", text_auto=True)
+                fig.update_layout(showlegend=False, xaxis_title="Unidades", yaxis_title=None)
+                st.plotly_chart(fig, use_container_width=True)
 
     with col_d:
-        st.subheader("🏆 Market Share Acumulado")
-        # Tabla simple de top 15
-        top = df_view.groupby('MARCA')['CANTIDAD'].sum().sort_values(ascending=False).head(15).reset_index()
-        top['Share'] = (top['CANTIDAD'] / top['CANTIDAD'].sum()) * 100
-        
-        # Usamos Native Column Config para barras de progreso
-        st.dataframe(
-            top,
-            column_config={
-                "CANTIDAD": st.column_config.ProgressColumn("Volumen", format="%d", min_value=0, max_value=top['CANTIDAD'].max()),
-                "Share": st.column_config.NumberColumn("Part. %", format="%.1f%%")
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-
-    # --- SECCIÓN C: ANÁLISIS YoY (YEAR OVER YEAR) AVANZADO ---
-    st.markdown("---")
-    st.subheader("📊 Análisis de Crecimiento Anual (YoY)")
-    st.info("💡 Este panel compara el rendimiento del Año Actual vs el Año Anterior seleccionado.")
-
-    # Selectores dinámicos
-    dim_col = st.radio("Dimensión de Análisis:", ["MARCA", "MODELO", "COMBUSTIBLE", "CARROCERIA"], horizontal=True)
-    
-    # Lógica Matemática YoY
-    if len(sel_years) >= 2:
-        curr_y = max(sel_years)
-        prev_y = curr_y - 1 # Asumimos comparación con n-1
-        
-        # Dataframes separados
-        df_curr = df_view[df_view['AÑO'] == curr_y]
-        df_prev = df_main[df_main['AÑO'] == prev_y] # Usamos df_main para tener contexto completo del año anterior
-        
-        # Agrupaciones
-        grp_curr = df_curr.groupby(dim_col).agg(Vol_Actual=('CANTIDAD','sum'), CIF_Actual=('VALOR US$ CIF','sum')).reset_index()
-        grp_prev = df_prev.groupby(dim_col).agg(Vol_Prev=('CANTIDAD','sum'), CIF_Prev=('VALOR US$ CIF','sum')).reset_index()
-        
-        # Cálculo de Share relativo a su propio año
-        grp_curr['Share_Actual'] = (grp_curr['Vol_Actual'] / grp_curr['Vol_Actual'].sum()) * 100
-        grp_prev['Share_Prev'] = (grp_prev['Vol_Prev'] / grp_prev['Vol_Prev'].sum()) * 100
-        
-        # Fusión de datos (Outer join para no perder marcas que existían antes y ahora no, o viceversa)
-        df_yoy = pd.merge(grp_curr, grp_prev, on=dim_col, how='outer').fillna(0)
-        
-        # Cálculo de Deltas (Variaciones)
-        df_yoy['Δ Share (pp)'] = df_yoy['Share_Actual'] - df_yoy['Share_Prev']
-        df_yoy['Δ Inversión ($)'] = df_yoy['CIF_Actual'] - df_yoy['CIF_Prev']
-        
-        # Crear columnas visuales de estado
-        df_yoy['Estado'] = np.where(df_yoy['Δ Share (pp)'] >= 0, '🟢 Ganó', '🔻 Perdió')
-
-        # --- SOLUCIÓN AL ERROR DE MATPLOTLIB ---
-        # En lugar de usar .style.background_gradient (que requiere matplotlib),
-        # usamos st.column_config para formatear visualmente la tabla de forma nativa.
-        
-        st.dataframe(
-            df_yoy.sort_values('Vol_Actual', ascending=False).head(50),
-            column_config={
-                dim_col: st.column_config.TextColumn("Categoría", width="medium"),
-                "Vol_Actual": st.column_config.NumberColumn("Vol '24", format="%d"),
-                "Vol_Prev": st.column_config.NumberColumn("Vol '23", format="%d"),
-                "Share_Actual": st.column_config.ProgressColumn("Share Actual", format="%.1f%%", min_value=0, max_value=30),
-                "Δ Share (pp)": st.column_config.NumberColumn("Var Share", format="%+.1f pp"), # El + fuerza el signo
-                "Δ Inversión ($)": st.column_config.NumberColumn("Var Inversión", format="$%d"),
-                "Estado": st.column_config.TextColumn("Tendencia")
-            },
-            hide_index=True,
-            use_container_width=True
-        )
-    else:
-        st.warning("⚠️ Selecciona al menos 2 años (ej: 2024 y 2023) para habilitar el cálculo de crecimiento.")
-
-    # Preparar datos para PDF
-    pdf_dataset = df_view
-    pdf_title = "Reporte Macro Pais"
-
-
-# ------------------------------------------------------------------------------
-# MÓDULO 2: BENCHMARK (GUERRA DE MARCAS)
-# ------------------------------------------------------------------------------
-elif menu == "⚔️ 2. Guerra de Marcas (Benchmark)":
-    st.title(f"⚔️ Benchmarking Competitivo: {st.session_state['time_view']}")
-    
-    with st.sidebar:
-        st.markdown("### 🎯 Selección de Rivales")
-        years_avail = sorted(df_main['AÑO'].unique(), reverse=True)
-        sel_years = st.multiselect("Años a Comparar", years_avail, default=years_avail[:1])
-        df_curr = df_main[df_main['AÑO'].isin(sel_years)]
-        
-        # Selector inteligente de marcas
-        all_brands = sorted(df_curr['MARCA'].unique())
-        if st.checkbox("Seleccionar Todas las Marcas", value=False):
-            sel_brands = all_brands
+        st.subheader("🏆 Market Share (Top 15)")
+        top = top_share(df_view, dim="MARCA", top_n=15)
+        if top.empty:
+            st.info("Sin datos para ranking.")
         else:
-            default_top = df_curr['MARCA'].value_counts().head(3).index.tolist()
-            sel_brands = st.multiselect("Marcas", all_brands, default=default_top)
+            st.dataframe(
+                top,
+                column_config={
+                    "CANTIDAD": st.column_config.ProgressColumn("Volumen", format="%d", min_value=0, max_value=int(top["CANTIDAD"].max() or 1)),
+                    "Share": st.column_config.NumberColumn("Part. %", format="%.1f%%"),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
 
-    df_view = df_curr[df_curr['MARCA'].isin(sel_brands)].copy()
-    
-    if not df_view.empty:
-        # Pestañas de Análisis
-        t1, t2, t3 = st.tabs(["📊 Volumen & Mix", "💰 Precios", "🕵️ Auditoría Gris"])
-        
-        with t1:
-            c1, c2 = st.columns(2)
-            with c1:
-                st.subheader("6. Batalla de Volumen")
-                st.plotly_chart(px.bar(df_view, x='MARCA', y='CANTIDAD', color='AÑO', barmode='group'), use_container_width=True)
-            with c2:
-                # GRÁFICO NUEVO SOLICITADO: MIX DE COMBUSTIBLE POR MARCA
-                st.subheader("9. Estrategia de Motorización")
-                st.plotly_chart(px.bar(df_view, x='MARCA', y='CANTIDAD', color='COMBUSTIBLE', title="Mix: Eléctrico vs Combustión"), use_container_width=True)
+    st.markdown("---")
+    st.subheader("📊 Crecimiento Anual (YoY)")
+    st.caption("Compara el año máximo seleccionado vs el año anterior (n-1).")
 
-        with t2:
-            st.subheader("7. Matriz de Precios")
-            # Filtro visual para evitar distorsión por errores de data
-            df_p = df_view[(df_view['CIF_UNITARIO'] > 2000) & (df_view['CIF_UNITARIO'] < 150000)]
-            
-            fig_box = px.box(df_p, x='MARCA', y='CIF_UNITARIO', color='MARCA', points="outliers")
-            fig_box.update_layout(showlegend=False)
-            st.plotly_chart(fig_box, use_container_width=True)
-            st.caption("Cajas alargadas indican un portafolio de precios amplio. Cajas pequeñas indican nicho.")
+    dim_col = st.radio("Dimensión:", ["MARCA", "MODELO", "COMBUSTIBLE", "CARROCERIA"], horizontal=True)
+    if dim_col not in df_main.columns:
+        st.warning(f"No existe la columna {dim_col}.")
+    else:
+        df_yoy = yoy_table(df_main, df_view, dim_col, sel_years)
+        if df_yoy is None:
+            st.warning("Selecciona al menos 2 años para habilitar el YoY.")
+        else:
+            df_show = df_yoy.sort_values("Vol_Actual", ascending=False).head(50)
+            st.dataframe(
+                df_show,
+                column_config={
+                    dim_col: st.column_config.TextColumn("Categoría"),
+                    "Vol_Actual": st.column_config.NumberColumn("Vol (Actual)", format="%d"),
+                    "Vol_Prev": st.column_config.NumberColumn("Vol (Prev)", format="%d"),
+                    "Share_Actual": st.column_config.ProgressColumn("Share Actual", format="%.1f%%", min_value=0, max_value=30),
+                    "Δ Share (pp)": st.column_config.NumberColumn("Var Share", format="%+.1f pp"),
+                    "Δ Inversión ($)": st.column_config.NumberColumn("Var Inversión", format="$%d"),
+                    "Estado": st.column_config.TextColumn("Tendencia"),
+                },
+                hide_index=True,
+                use_container_width=True,
+            )
 
-        with t3:
-            st.subheader("8. Auditoría de Fuga (Oficial vs Paralelo)")
-            
-            # Algoritmo de Detección de Oficiales
-            gb = df_view.groupby(['MARCA', 'EMPRESA'])['CANTIDAD'].sum().reset_index()
-            # Asumimos que el mayor importador es el Oficial
-            lideres = gb.sort_values(['MARCA', 'CANTIDAD'], ascending=[True, False]).drop_duplicates('MARCA')
-            lideres = lideres.rename(columns={'EMPRESA': 'LIDER_OFICIAL'})[['MARCA', 'LIDER_OFICIAL']]
-            
-            df_view = df_view.merge(lideres, on='MARCA', how='left')
-            df_view['CANAL'] = np.where(df_view['EMPRESA'] == df_view['LIDER_OFICIAL'], 'OFICIAL', 'GRIS')
-            
+    # Export dataset and title
+    return df_view, "Reporte Macro País"
+
+
+def page_benchmark(df_main: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    st.title(f"⚔️ Benchmarking Competitivo: {TIME_FULL if st.session_state['time_view']==TIME_FULL else 'YTD'}")
+    st.caption("Comparación de rivales (volumen, mix, precios, canal oficial vs gris).")
+
+    years_avail = sorted(df_main["AÑO"].unique(), reverse=True)
+    sel_years = st.multiselect("Años a comparar", years_avail, default=years_avail[:1] if years_avail else [])
+
+    if not sel_years:
+        st.warning("Selecciona al menos un año.")
+        return df_main.iloc[0:0].copy(), "Reporte Competitivo"
+
+    df_curr = df_main[df_main["AÑO"].isin(sel_years)].copy()
+    all_brands = sorted(df_curr["MARCA"].dropna().unique())
+
+    c0, c1 = st.columns([1, 2])
+    with c0:
+        select_all = st.checkbox("Seleccionar todas", value=False)
+    with c1:
+        default_top = df_curr["MARCA"].value_counts().head(3).index.tolist()
+        sel_brands = all_brands if select_all else st.multiselect("Marcas", all_brands, default=default_top)
+
+    if not sel_brands:
+        st.warning("Selecciona al menos una marca.")
+        return df_curr.iloc[0:0].copy(), "Reporte Competitivo"
+
+    df_view = df_curr[df_curr["MARCA"].isin(sel_brands)].copy()
+    if df_view.empty:
+        st.info("No hay datos para la selección.")
+        return df_view, "Reporte Competitivo"
+
+    t1, t2, t3 = st.tabs(["📊 Volumen & Mix", "💰 Precios", "🕵️ Auditoría Gris"])
+
+    with t1:
+        col1, col2 = st.columns(2)
+        with col1:
+            st.subheader("Batalla de Volumen")
+            fig = px.bar(df_view, x="MARCA", y="CANTIDAD", color="AÑO", barmode="group")
+            st.plotly_chart(fig, use_container_width=True)
+        with col2:
+            st.subheader("Estrategia de Motorización (Mix)")
+            if "COMBUSTIBLE" in df_view.columns:
+                fig = px.bar(df_view, x="MARCA", y="CANTIDAD", color="COMBUSTIBLE", barmode="stack")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No existe columna COMBUSTIBLE.")
+
+    with t2:
+        st.subheader("Matriz de Precios (CIF Unitario)")
+        if "CIF_UNITARIO" not in df_view.columns:
+            st.info("No se pudo calcular CIF_UNITARIO.")
+        else:
+            df_p = df_view[(df_view["CIF_UNITARIO"] > CIF_MIN_VALID) & (df_view["CIF_UNITARIO"] < CIF_MAX_VALID)].copy()
+            if df_p.empty:
+                st.info("Sin datos válidos de precios en el rango.")
+            else:
+                fig = px.box(df_p, x="MARCA", y="CIF_UNITARIO", color="MARCA", points="outliers")
+                fig.update_layout(showlegend=False, yaxis_title="CIF unitario")
+                st.plotly_chart(fig, use_container_width=True)
+                st.caption("Cajas alargadas = portafolio amplio; cajas pequeñas = nicho o consistencia de precios.")
+
+    with t3:
+        st.subheader("Auditoría de Fuga (Oficial vs Paralelo)")
+        if "EMPRESA" not in df_view.columns:
+            st.info("No existe columna EMPRESA.")
+        else:
+            gb = df_view.groupby(["MARCA", "EMPRESA"])["CANTIDAD"].sum().reset_index()
+            lideres = gb.sort_values(["MARCA", "CANTIDAD"], ascending=[True, False]).drop_duplicates("MARCA")
+            lideres = lideres.rename(columns={"EMPRESA": "LIDER_OFICIAL"})[["MARCA", "LIDER_OFICIAL"]]
+            df_x = df_view.merge(lideres, on="MARCA", how="left")
+            df_x["CANAL"] = np.where(df_x["EMPRESA"] == df_x["LIDER_OFICIAL"], "OFICIAL", "GRIS")
+
             c_g1, c_g2 = st.columns(2)
             with c_g1:
-                # Gráfico Barras Apiladas
-                resumen = df_view.groupby(['MARCA', 'CANAL'])['CANTIDAD'].sum().unstack().fillna(0).reset_index()
-                st.plotly_chart(px.bar(resumen, x='MARCA', y=[c for c in ['OFICIAL', 'GRIS'] if c in resumen.columns], 
-                                       title="Volumen Absoluto", 
-                                       color_discrete_map={'OFICIAL':'#27ae60', 'GRIS':'#95a5a6'}), use_container_width=True)
+                resumen = df_x.groupby(["MARCA", "CANAL"])["CANTIDAD"].sum().unstack().fillna(0).reset_index()
+                cols = [c for c in ["OFICIAL", "GRIS"] if c in resumen.columns]
+                fig = px.bar(
+                    resumen,
+                    x="MARCA",
+                    y=cols,
+                    barmode="stack",
+                    title="Volumen por Canal",
+                    color_discrete_map={"OFICIAL": "#27ae60", "GRIS": "#95a5a6"},
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
             with c_g2:
-                # GRÁFICO NUEVO SOLICITADO: RANKING DE % DE FUGA
-                if 'GRIS' in resumen.columns:
-                    resumen['Total'] = resumen['OFICIAL'] + resumen['GRIS']
-                    resumen['% Fuga'] = (resumen['GRIS'] / resumen['Total']) * 100
-                    
-                    fig_pct = px.bar(resumen, x='MARCA', y='% Fuga', title="Ranking de Vulnerabilidad (% Fuga)", 
-                                     text_auto='.1f', color='% Fuga', color_continuous_scale='Reds')
-                    st.plotly_chart(fig_pct, use_container_width=True)
+                if "GRIS" in resumen.columns and "OFICIAL" in resumen.columns:
+                    resumen["Total"] = resumen["OFICIAL"] + resumen["GRIS"]
+                    resumen["% Fuga"] = np.where(resumen["Total"] > 0, resumen["GRIS"] / resumen["Total"] * 100, 0)
+                    fig = px.bar(
+                        resumen.sort_values("% Fuga", ascending=False),
+                        x="MARCA",
+                        y="% Fuga",
+                        title="Ranking Vulnerabilidad (% Fuga)",
+                        text_auto=".1f",
+                        color="% Fuga",
+                        color_continuous_scale="Reds",
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
                 else:
                     st.success("No se detectó fuga relevante en las marcas seleccionadas.")
-            
-            st.markdown("**Identidad del Distribuidor Oficial Detectado:**")
-            st.dataframe(lideres.set_index('MARCA'), use_container_width=True)
 
-    pdf_dataset = df_view
-    pdf_title = "Reporte Competitivo"
+            st.markdown("**Distribuidor oficial detectado (heurística: mayor importador por marca):**")
+            st.dataframe(lideres.set_index("MARCA"), use_container_width=True)
+
+    return df_view, "Reporte Competitivo"
 
 
-# ------------------------------------------------------------------------------
-# MÓDULO 3: DEEP DIVE (AUDITORÍA DE MARCA)
-# ------------------------------------------------------------------------------
-elif menu == "🔍 3. Auditoría de Marca (Deep Dive)":
-    st.title(f"🔍 Auditoría Profunda: {st.session_state['time_view']}")
-    
-    with st.sidebar:
-        st.markdown("### 🎯 Objetivo")
-        y_dd = st.selectbox("Año Fiscal", sorted(df_main['AÑO'].unique(), reverse=True))
-        df_y = df_main[df_main['AÑO'] == y_dd]
-        
-        brand_dd = st.selectbox("Marca a Auditar", sorted(df_y['MARCA'].unique()))
-        df_view = df_y[df_y['MARCA'] == brand_dd].copy()
+def page_deep_dive(df_main: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+    st.title(f"🔍 Auditoría Profunda: {TIME_FULL if st.session_state['time_view']==TIME_FULL else 'YTD'}")
+    st.caption("Análisis a nivel marca: Pareto, tendencia, logística y estacionalidad.")
 
-    if not df_view.empty:
-        # Panel de KPIs
-        with st.container():
-            k1, k2, k3, k4 = st.columns(4)
-            k1.metric("Volumen", f"{df_view['CANTIDAD'].sum():,.0f}")
-            k2.metric("CIF Promedio", f"${df_view['CIF_UNITARIO'].mean():,.0f}")
-            k3.metric("Flete Promedio", f"${df_view['FLETE_UNITARIO'].mean():,.0f}")
-            k4.metric("Modelos Activos", f"{df_view['MODELO'].nunique()}")
-        
-        tab_a, tab_b, tab_c = st.tabs(["Eficiencia (Pareto)", "Futuro (Forecast)", "Logística"])
-        
-        with tab_a:
-            # 11. ANÁLISIS DE PARETO
-            st.subheader("11. Eficiencia de Portafolio")
-            pareto = df_view.groupby('MODELO')['CANTIDAD'].sum().sort_values(ascending=False).reset_index()
-            pareto['% Acum'] = (pareto['CANTIDAD'].cumsum() / pareto['CANTIDAD'].sum()) * 100
-            pareto['Clasificación'] = np.where(pareto['% Acum'] <= 80, 'A (Vital)', 'B (Cola)')
-            
-            fig_p = px.bar(pareto, x='MODELO', y='CANTIDAD', color='Clasificación', 
-                           color_discrete_map={'A (Vital)': '#27ae60', 'B (Cola)': '#95a5a6'})
-            st.plotly_chart(fig_p, use_container_width=True)
-            
-        with tab_b:
-            c_f1, c_f2 = st.columns(2)
-            with c_f1:
-                # 12. FORECAST
-                st.subheader("12. Proyección de Tendencia")
-                mensual = df_view.groupby('MES_NUM')['CANTIDAD'].sum().reset_index()
-                mensual['Fecha'] = pd.to_datetime(str(y_dd) + '-' + mensual['MES_NUM'].astype(str) + '-01')
-                
-                try:
-                    # Intento de regresión lineal (OLS)
-                    fig_tr = px.scatter(mensual, x='Fecha', y='CANTIDAD', trendline="ols", trendline_color_override="red")
-                    fig_tr.update_traces(mode='lines+markers')
-                    st.plotly_chart(fig_tr, use_container_width=True)
-                except:
-                    # Fallback si hay pocos datos
-                    st.line_chart(mensual.set_index('Fecha')['CANTIDAD'])
+    years_avail = sorted(df_main["AÑO"].unique(), reverse=True)
+    if not years_avail:
+        st.warning("No hay años disponibles.")
+        return df_main.iloc[0:0].copy(), "Auditoría"
 
-            with c_f2:
-                # 14. TICKET EVOLUTION
-                st.subheader("14. Evolución de Precio (Ticket)")
-                evol_precio = df_view.groupby('MES_NUM')['CIF_UNITARIO'].mean().reset_index()
-                evol_precio['Fecha'] = pd.to_datetime(str(y_dd) + '-' + evol_precio['MES_NUM'].astype(str) + '-01')
-                st.plotly_chart(px.line(evol_precio, x='Fecha', y='CIF_UNITARIO', markers=True), use_container_width=True)
+    y = st.selectbox("Año fiscal", years_avail)
+    df_y = df_main[df_main["AÑO"] == y].copy()
 
-        with tab_c:
-            c_l1, c_l2 = st.columns(2)
-            with c_l1:
-                # 13. SEMÁFORO LOGÍSTICO
-                st.subheader("13. Costos Logísticos")
-                fletes = df_view[(df_view['FLETE_UNITARIO'] > 50) & (df_view['FLETE_UNITARIO'] < 8000)]
-                if not fletes.empty:
-                    st.plotly_chart(px.box(fletes, y='FLETE_UNITARIO', title="Dispersión Flete Unitario"), use_container_width=True)
+    brands = sorted(df_y["MARCA"].dropna().unique())
+    if not brands:
+        st.warning("No hay marcas en el año seleccionado.")
+        return df_y.iloc[0:0].copy(), "Auditoría"
+
+    brand = st.selectbox("Marca a auditar", brands)
+    df_view = df_y[df_y["MARCA"] == brand].copy()
+
+    if df_view.empty:
+        st.info("No hay datos para la marca/año seleccionados.")
+        return df_view, f"Auditoría {brand} ({y})"
+
+    vol = float(df_view["CANTIDAD"].sum())
+    cif_avg = float(df_view["CIF_UNITARIO"].mean()) if "CIF_UNITARIO" in df_view.columns else 0.0
+    flete_avg = float(df_view["FLETE_UNITARIO"].mean()) if "FLETE_UNITARIO" in df_view.columns else 0.0
+    modelos = int(df_view["MODELO"].nunique()) if "MODELO" in df_view.columns else 0
+
+    kpi_row([
+        ("Volumen", f"{vol:,.0f}", ""),
+        ("CIF Promedio", human_money(cif_avg), ""),
+        ("Flete Promedio", human_money(flete_avg), ""),
+        ("Modelos Activos", f"{modelos:,}", ""),
+    ])
+
+    tab_a, tab_b, tab_c = st.tabs(["📌 Eficiencia (Pareto)", "📈 Futuro (Tendencia)", "🚚 Logística"])
+
+    with tab_a:
+        st.subheader("Eficiencia de Portafolio (Pareto)")
+        if "MODELO" not in df_view.columns:
+            st.info("No existe columna MODELO.")
+        else:
+            pareto = df_view.groupby("MODELO")["CANTIDAD"].sum().sort_values(ascending=False).reset_index()
+            total = pareto["CANTIDAD"].sum()
+            pareto["% Acum"] = (pareto["CANTIDAD"].cumsum() / total * 100) if total else 0
+            pareto["Clasificación"] = np.where(pareto["% Acum"] <= 80, "A (Vital)", "B (Cola)")
+            fig = px.bar(
+                pareto.head(40),
+                x="MODELO",
+                y="CANTIDAD",
+                color="Clasificación",
+                color_discrete_map={"A (Vital)": "#27ae60", "B (Cola)": "#95a5a6"},
+            )
+            fig.update_layout(xaxis_title=None)
+            st.plotly_chart(fig, use_container_width=True)
+            st.dataframe(pareto.head(50), hide_index=True, use_container_width=True)
+
+    with tab_b:
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.subheader("Proyección de Tendencia (regresión simple)")
+            mensual = df_view.groupby("MES_NUM")["CANTIDAD"].sum().reset_index().sort_values("MES_NUM")
+            if mensual.empty:
+                st.info("Sin datos mensuales.")
+            else:
+                x = mensual["MES_NUM"].to_numpy(dtype=float)
+                yv = mensual["CANTIDAD"].to_numpy(dtype=float)
+                m, b = linear_regression_forecast(x, yv)
+                mensual["Pred"] = m * mensual["MES_NUM"] + b
+                mensual["Mes"] = mensual["MES_NUM"].apply(month_abbr_es)
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=mensual["Mes"], y=mensual["CANTIDAD"], mode="lines+markers", name="Real"))
+                fig.add_trace(go.Scatter(x=mensual["Mes"], y=mensual["Pred"], mode="lines", name="Tendencia", line=dict(color="red")))
+                fig.update_layout(yaxis_title="Unidades", xaxis_title=None)
+                st.plotly_chart(fig, use_container_width=True)
+
+        with c2:
+            st.subheader("Evolución de Precio (Ticket)")
+            if "CIF_UNITARIO" not in df_view.columns:
+                st.info("No se pudo calcular CIF_UNITARIO.")
+            else:
+                evo = df_view.groupby("MES_NUM")["CIF_UNITARIO"].mean().reset_index().sort_values("MES_NUM")
+                evo["Mes"] = evo["MES_NUM"].apply(month_abbr_es)
+                fig = px.line(evo, x="Mes", y="CIF_UNITARIO", markers=True, labels={"CIF_UNITARIO": "CIF unitario"})
+                st.plotly_chart(fig, use_container_width=True)
+
+    with tab_c:
+        c1, c2 = st.columns(2)
+
+        with c1:
+            st.subheader("Costos Logísticos (Flete unitario)")
+            if "FLETE_UNITARIO" not in df_view.columns:
+                st.info("No se pudo calcular FLETE_UNITARIO.")
+            else:
+                fletes = df_view[(df_view["FLETE_UNITARIO"] > FLETE_MIN_VALID) & (df_view["FLETE_UNITARIO"] < FLETE_MAX_VALID)].copy()
+                if fletes.empty:
+                    st.info("Sin datos de fletes válidos en el rango.")
                 else:
-                    st.info("Sin datos de fletes válidos.")
-            
-            with c_l2:
-                # 15. ESTACIONALIDAD (CORRECCIÓN DEL ERROR DE IMPORT)
-                st.subheader("15. Mapa de Calor Estacional")
-                
-                # Preparamos datos para Heatmap de Plotly (Nativo, no usa Matplotlib)
-                heatmap_data = df_view.groupby('MES_NUM')['CANTIDAD'].sum().reset_index()
-                heatmap_data['Nombre_Mes'] = heatmap_data['MES_NUM'].apply(lambda x: calendar.month_abbr[x])
-                
-                # Creamos Heatmap interactivo
-                fig_heat = px.density_heatmap(
-                    heatmap_data, 
-                    x="Nombre_Mes", 
-                    y="CANTIDAD", 
-                    nbinsx=12, 
-                    title="Intensidad de Importación por Mes", 
-                    color_continuous_scale="Blues"
+                    fig = px.box(fletes, y="FLETE_UNITARIO", points="outliers", title="Dispersión Flete Unitario")
+                    fig.update_layout(yaxis_title="USD por unidad")
+                    st.plotly_chart(fig, use_container_width=True)
+
+        with c2:
+            st.subheader("Mapa de Calor Estacional (intensidad)")
+            heat = df_view.groupby("MES_NUM")["CANTIDAD"].sum().reset_index().sort_values("MES_NUM")
+            if heat.empty:
+                st.info("Sin datos mensuales.")
+            else:
+                heat["Mes"] = heat["MES_NUM"].apply(month_abbr_es)
+                # Heatmap simple (mes vs valor). Para 1D, lo renderizamos como barra de calor.
+                fig = px.density_heatmap(
+                    heat,
+                    x="Mes",
+                    y="CANTIDAD",
+                    nbinsx=12,
+                    title="Intensidad de Importación por Mes",
+                    color_continuous_scale="Blues",
                 )
-                st.plotly_chart(fig_heat, use_container_width=True)
+                st.plotly_chart(fig, use_container_width=True)
 
-    pdf_dataset = df_view
-    pdf_title = f"Auditoria {brand_dd} ({y_dd})"
+    return df_view, f"Auditoría {brand} ({y})"
+
 
 # ==============================================================================
+# 8) EXPORTS / DOWNLOADS
 # ==============================================================================
-# 7. EXPORTACIÓN PDF (BOTÓN FINAL)
-# ==============================================================================
-# ==============================================================================
+def sidebar_exports(df: pd.DataFrame, pdf_title: str) -> None:
+    with st.sidebar:
+        st.divider()
+        st.markdown("### 📤 Exportar")
 
-if 'pdf_dataset' in locals() and not pdf_dataset.empty:
-    st.sidebar.divider()
-    st.sidebar.markdown("### 📥 Exportar Reporte")
-    
+        # CSV download (filtered)
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Descargar CSV (filtrado)",
+            data=csv,
+            file_name=f"data_{pdf_title.replace(' ', '_')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+        # PDF
+        try:
+            data_dict = df.to_dict(orient="list")
+            view_label = "Full Year" if st.session_state["time_view"] == TIME_FULL else "YTD"
+            pdf_bytes = build_pdf_bytes(
+                data_dict,
+                pdf_title,
+                subtitle=f"Modo: {view_label}",
+                view_mode=view_label,
+            )
+            st.download_button(
+                "📄 Descargar PDF Ejecutivo",
+                data=pdf_bytes,
+                file_name=f"Reporte_{pdf_title.replace(' ', '_')}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+            )
+        except Exception as e:
+            st.warning(f"Error generando PDF: {e}")
+
+
+# ==============================================================================
+# 9) MAIN APP
+# ==============================================================================
+def main() -> None:
+    init_session_state()
+    inject_custom_css()
+
+    # Load data (with fallback)
+    df_raw, ultima_fecha, source_mode = load_data_flow()
+
+    sidebar_controls(df_raw, ultima_fecha, source_mode)
+
+    if st.session_state.get("debug_mode"):
+        render_debug_panel(df_raw, ultima_fecha)
+
+    if df_raw is None:
+        st.title("📉 Dashboard Autos CR")
+        st.error("No hay datos cargados. Sube un parquet en el sidebar o configura DATA_URL / DATA_PATH.")
+        st.stop()
+
+    # Validate required columns; show readable error if missing
+    df_raw, missing = ensure_required_columns(df_raw)
+    if missing:
+        st.title("📉 Dashboard Autos CR")
+        st.error(f"Faltan columnas requeridas: {missing}")
+        st.info("Solución: revisar el parquet o mapear nombres de columnas en CANON_COLS.")
+        if st.session_state.get("debug_mode"):
+            st.write("Columnas detectadas:", list(df_raw.columns))
+        st.stop()
+
+    # Apply time view
+    df_main = apply_time_view(df_raw, ultima_fecha)
+
+    # Route to module
+    menu = st.session_state.get("menu", "🌍 1. Visión País (Macro)")
+
+    pdf_dataset = df_main.iloc[0:0].copy()
+    pdf_title = "Reporte"
+
+    if menu == "🌍 1. Visión País (Macro)":
+        pdf_dataset, pdf_title = page_macro(df_main)
+    elif menu == "⚔️ 2. Guerra de Marcas (Benchmark)":
+        pdf_dataset, pdf_title = page_benchmark(df_main)
+    elif menu == "🔍 3. Auditoría de Marca (Deep Dive)":
+        pdf_dataset, pdf_title = page_deep_dive(df_main)
+    else:
+        st.warning("Módulo no reconocido.")
+
+    # Exports
+    if pdf_dataset is not None and not pdf_dataset.empty:
+        sidebar_exports(pdf_dataset, pdf_title)
+
+    # Memory cleanup
+    gc.collect()
+
+
+# Entrypoint
+if __name__ == "__main__":
     try:
-        # Optimización: Serialización ligera a Dict para el caché
-        data_dict = pdf_dataset.to_dict(orient='list')
-        
-        # Generación PDF en Background
-        pdf_bytes = generar_pdf_master(
-            data_dict, 
-            pdf_title, 
-            f"Modo: {st.session_state['time_view']}", 
-            st.session_state['time_view']
-        )
-        
-        # Botón de Descarga
-        st.sidebar.download_button(
-            label="💾 Descargar PDF Ejecutivo",
-            data=pdf_bytes,
-            file_name=f"Reporte_{pdf_title.replace(' ','_')}.pdf",
-            mime="application/pdf"
-        )
-    except Exception as e:
-        st.sidebar.warning(f"Error generando PDF: {e}")
-
-# Limpieza final de memoria
-gc.collect()
+        main()
+    except Exception as ex:
+        # Hard-fail safety
+        set_last_error(str(ex))
+        st.error("Error inesperado en la app. Activa 'Modo debug' para ver detalles.")
+        with st.expander("Detalles técnicos", expanded=False):
+            st.code(traceback.format_exc())
