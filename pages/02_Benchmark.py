@@ -23,7 +23,7 @@ st.set_page_config(
 #clear_figure_registry()
 
 # Render sidebar and get filters
-sidebar_state = sidebar_common()
+#sidebar_state = sidebar_common()
 
 # Page header
 render_page_header(
