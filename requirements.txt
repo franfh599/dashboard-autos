@@ -5,4 +5,6 @@ plotly>=5,<6
 pyarrow>=12
 fpdf>=1.7
 kaleido>=0.2.1
+pyarrow>=12.0
+
 
