@@ -4,10 +4,10 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, timedelta
 
-from market_suite.state import init_session_state, clear_figure_registry
-from market_suite.data import load_data_flow, apply_time_view, ensure_required_columns
-from market_suite.analytics import agg_monthly, top_share, yoy_table
-from market_suite.ui import sidebar_common, render_page_header, render_figure_with_registry, show_loading_spinner
+#from market_suite.state import init_session_state, clear_figure_registry
+#from market_suite.data import load_data_flow, apply_time_view, ensure_required_columns
+#from market_suite.analytics import agg_monthly, top_share, yoy_table
+#from market_suite.ui import sidebar_common, render_page_header, render_figure_with_registry, show_loading_spinner
 
 # Configure page
 st.set_page_config(
@@ -17,10 +17,10 @@ st.set_page_config(
 )
 
 # Initialize session state
-init_session_state()
+#init_session_state()
 
 # Clear previous figures from registry
-clear_figure_registry()
+#clear_figure_registry()
 
 # Render sidebar and get filters
 sidebar_state = sidebar_common()
