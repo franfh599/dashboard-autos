@@ -1,3 +1,4 @@
+# ── Streamlit Dashboard ──────────────────────────────────────────────────────
 streamlit>=1.25,<2
 pandas>=2.0,<3
 numpy>=1.23,<3
@@ -5,6 +6,9 @@ plotly>=5,<6
 pyarrow>=12
 fpdf>=1.7
 kaleido>=0.2.1
-pyarrow>=12.0
 
-
+# ── BYD Ads Scraper ──────────────────────────────────────────────────────────
+playwright>=1.40           # navegador headless (Chromium)
+openpyxl>=3.1              # creación de archivos Excel (.xlsx)
+Pillow>=10.0               # procesamiento de imágenes + thumbnails en Excel
+requests>=2.31             # descarga de imágenes y llamadas a la API de Facebook
