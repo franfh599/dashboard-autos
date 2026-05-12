@@ -36,7 +36,8 @@ from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
-from playwright.async_api import async_playwright
+# playwright imported lazily inside scrape() so this module can be imported
+# by byd_ads_app.py even when playwright is not installed
 
 # =============================================================================
 # CONFIG
@@ -455,6 +456,7 @@ async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
     collected: list[dict] = []
     seen: set[str] = set()
 
+    from playwright.async_api import async_playwright  # lazy import
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=headless,
