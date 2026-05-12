@@ -5,21 +5,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-# Run the Streamlit dashboard (dev)
-streamlit run app.py --server.enableCORS false --server.enableXsrfProtection false
-
 # Install all dependencies
 pip install -r requirements.txt
+playwright install chromium   # one-time: install headless browser for the scraper
 
-# Install Playwright browsers (required once for the BYD scraper)
-playwright install chromium
+# ── EV Market dashboard ───────────────────────────────────────────────────────
+streamlit run app.py --server.enableCORS false --server.enableXsrfProtection false
 
-# Run the BYD ads scraper (Playwright headless browser)
-python byd_scraper.py
-python byd_scraper.py --max 100 --visible      # open visible browser for debugging
-python byd_scraper.py --output my_file.xlsx
+# ── BYD Ads Intelligence UI (scraper + viewer in one) ─────────────────────────
+streamlit run byd_ads_app.py --server.enableCORS false --server.enableXsrfProtection false
 
-# Run the BYD ads scraper via Facebook's official API
+# ── Run the BYD scraper standalone (Playwright headless browser) ──────────────
+python byd_scraper.py                          # 300 ads, headless
+python byd_scraper.py --max 100 --visible      # visible browser (debug)
+python byd_scraper.py --output my_file.xlsx    # custom output path
+
+# ── Run the BYD scraper via Facebook's official API ──────────────────────────
 export FB_ACCESS_TOKEN="EAAxxxx..."
 python byd_api_scraper.py
 python byd_api_scraper.py --token "EAAxxxx..." --max 500
@@ -60,18 +61,24 @@ historial_lite.parquet (334 k rows, 35 cols)
 
 **Key parquet columns after canonicalization:** `fecha` (datetime), `año` (int), `marca`, `modelo`, `precio` (float), `empresa`, `distribuidor`, `combustible`, `categoria`, `cantidad` (int), `valor us$ cif` (float).
 
-### BYD Ads Scrapers
+### BYD Ads Intelligence (`byd_ads_app.py` + `byd_scraper.py` + `byd_api_scraper.py`)
 
-Two standalone CLI scripts — no Streamlit dependency:
+**`byd_ads_app.py`** — Streamlit app that is the main UI for the entire BYD ads workflow:
+- Sidebar panel to trigger `byd_scraper.py` as a subprocess and stream live output
+- Analytics charts: platform donut, CTA bar, impressions distribution, monthly timeline
+- Ad gallery grid (3 columns, paginated 12/page) — each card shows the actual ad image, headline, body text, and metadata badges (CTA, platform, impressions, date)
+- "Ver anuncio completo" expander on each card with full detail + large image
+- Filters: text search, platform multi-select, CTA multi-select
+- One-click Excel export of the current filtered view
+- Reads from `byd_ads_output/ads_raw_*.json` (auto-selects latest; dropdown to choose older runs)
 
-**`byd_scraper.py`** — Playwright (headless Chromium). Navigates to the public Facebook Ads Library page for `PAGE_ID=129337183749169`, scrolls to trigger dynamic loading, extracts ad cards via CSS selectors with a JS heuristic fallback, downloads images, and produces:
-- `byd_ads_output/BYD_CR_Ads_<timestamp>.xlsx` — formatted Excel with embedded image thumbnails
-- `byd_ads_output/ads_raw_<timestamp>.json` — raw backup
+**`byd_scraper.py`** — Playwright (headless Chromium). Navigates to the public Facebook Ads Library page for `PAGE_ID=129337183749169`, scrolls to trigger dynamic loading, extracts ad cards via CSS selectors with a JS heuristic fallback, downloads ad images immediately (before CDN tokens expire), and produces:
+- `byd_ads_output/BYD_CR_Ads_<timestamp>.xlsx` — formatted Excel with embedded thumbnails
+- `byd_ads_output/ads_raw_<timestamp>.json` — structured JSON read by the Streamlit app
 - `byd_ads_output/images/` — downloaded ad images
+- `create_excel()` is a public function imported by `byd_ads_app.py` for the in-app download button
 
-**`byd_api_scraper.py`** — Facebook Graph API (`/v21.0/ads_archive`). Requires a Facebook Access Token (from `FB_ACCESS_TOKEN` env var or `--token` arg). More reliable than the browser scraper but needs manual token setup at `developers.facebook.com`. Outputs the same Excel/JSON format.
-
-Both scrapers share the same Excel column layout (N°, ID Anuncio, Texto, Titular, Descripción, CTA, Fecha Inicio, Estado, Plataformas, Rango Impresiones, URL Imagen, Vista Previa) and write to `byd_ads_output/`.
+**`byd_api_scraper.py`** — Facebook Graph API (`/v21.0/ads_archive`). Requires a Facebook Access Token (from `FB_ACCESS_TOKEN` env var or `--token` arg). More reliable than the browser scraper. Outputs the same Excel/JSON format.
 
 ### Session State Keys
 

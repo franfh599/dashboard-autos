@@ -1,45 +1,39 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-BYD Costa Rica - Facebook Ads Library Scraper
-=============================================
+BYD Costa Rica – Facebook Ads Library Scraper
+==============================================
 Extrae todos los anuncios activos del concesionario BYD en Costa Rica
-desde la Biblioteca de Anuncios de Facebook y los exporta a Excel.
+desde la Biblioteca de Anuncios de Facebook y los exporta a Excel + JSON.
 
 Uso:
-    python byd_scraper.py
+    python byd_scraper.py                      # 300 anuncios, headless
+    python byd_scraper.py --max 100            # límite de anuncios
+    python byd_scraper.py --visible            # navegador visible (debug)
+    python byd_scraper.py --output mi.xlsx     # archivo de salida específico
 
-    Con opciones:
-    python byd_scraper.py --max 100 --headless
-    python byd_scraper.py --visible         # abre navegador visible (útil para debug)
-    python byd_scraper.py --output mi_archivo.xlsx
-
-Salida:
-    byd_ads_output/
-        BYD_CR_Ads_YYYYMMDD_HHMM.xlsx   ← Excel principal
-        ads_raw.json                     ← JSON de respaldo
-        images/                          ← Imágenes descargadas
+Salida (directorio byd_ads_output/):
+    BYD_CR_Ads_YYYYMMDD_HHMM.xlsx   – Excel con thumbnails incrustados
+    ads_raw_YYYYMMDD_HHMM.json      – JSON completo para la app Streamlit
+    images/                          – Imágenes descargadas
 """
 
 from __future__ import annotations
 import argparse
 import asyncio
+import base64
 import io
 import json
 import os
 import re
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlparse
 
 import requests
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
-from openpyxl.styles import (
-    Alignment, Border, Font, PatternFill, Side
-)
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from PIL import Image as PILImage
 from playwright.async_api import async_playwright
@@ -48,7 +42,7 @@ from playwright.async_api import async_playwright
 # CONFIG
 # =============================================================================
 
-PAGE_ID = "129337183749169"
+PAGE_ID  = "129337183749169"
 PAGE_NAME = "BYD Costa Rica"
 
 ADS_LIBRARY_URL = (
@@ -64,66 +58,64 @@ ADS_LIBRARY_URL = (
     f"&view_all_page_id={PAGE_ID}"
 )
 
-OUTPUT_DIR = Path("byd_ads_output")
-IMAGES_DIR = OUTPUT_DIR / "images"
+OUTPUT_DIR       = Path("byd_ads_output")
+IMAGES_DIR       = OUTPUT_DIR / "images"
 SCROLL_PAUSE_SEC = 3.0
-LOAD_TIMEOUT_MS = 45_000
-NO_CHANGE_LIMIT = 6      # stop scrolling after N scrolls with no new ads
-MAX_ADS_DEFAULT = 300
+LOAD_TIMEOUT_MS  = 45_000
+NO_CHANGE_LIMIT  = 7
+MAX_ADS_DEFAULT  = 300
 
-USER_AGENT = (
+UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/123.0.0.0 Safari/537.36"
+    "Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Excel brand colours
+C_NAVY   = "1A1A2E"
+C_RED    = "E31837"
+C_ALT    = "F4F6F9"
+C_BORDER = "DDDDDD"
+
 # =============================================================================
-# HELPERS
+# SETUP / UTILITIES
 # =============================================================================
 
-def setup_dirs() -> None:
+def setup() -> None:
     OUTPUT_DIR.mkdir(exist_ok=True)
     IMAGES_DIR.mkdir(exist_ok=True)
 
 
 def log(msg: str, indent: int = 0) -> None:
-    prefix = "  " * indent
-    print(f"{prefix}{msg}", flush=True)
+    print("  " * indent + msg, flush=True)
 
 
-def download_image(url: str, filename_stem: str) -> str | None:
-    """Download image to IMAGES_DIR. Returns local path or None."""
+def download_image(url: str, stem: str) -> str | None:
     if not url or not url.startswith("http"):
         return None
     try:
-        headers = {"User-Agent": USER_AGENT, "Referer": "https://www.facebook.com/"}
-        resp = requests.get(url, headers=headers, timeout=20, stream=True)
-        if resp.status_code != 200:
+        r = requests.get(
+            url,
+            headers={"User-Agent": UA, "Referer": "https://www.facebook.com/"},
+            timeout=20,
+            stream=True,
+        )
+        if r.status_code != 200:
             return None
-
-        ct = resp.headers.get("content-type", "")
-        ext = ".jpg"
-        if "png" in ct:
-            ext = ".png"
-        elif "webp" in ct:
-            ext = ".webp"
-        elif "gif" in ct:
-            ext = ".gif"
-
-        # Sanitize filename
-        safe = re.sub(r"[^\w\-]", "_", filename_stem)[:80]
+        ct  = r.headers.get("content-type", "")
+        ext = ".png" if "png" in ct else ".webp" if "webp" in ct else ".jpg"
+        safe = re.sub(r"[^\w\-]", "_", stem)[:80]
         fpath = IMAGES_DIR / f"{safe}{ext}"
         with open(fpath, "wb") as f:
-            for chunk in resp.iter_content(8192):
+            for chunk in r.iter_content(8192):
                 f.write(chunk)
         return str(fpath)
-    except Exception as exc:
-        log(f"[img] Error descargando {url[:60]}: {exc}", 2)
+    except Exception as e:
+        log(f"[img] {e}", 3)
         return None
 
 
-def thumbnail_bytes(path: str, size: tuple[int, int] = (150, 150)) -> io.BytesIO | None:
-    """Return PNG thumbnail as BytesIO for openpyxl."""
+def thumbnail_bytes(path: str, size=(160, 160)) -> io.BytesIO | None:
     try:
         img = PILImage.open(path).convert("RGB")
         img.thumbnail(size, PILImage.LANCZOS)
@@ -136,11 +128,10 @@ def thumbnail_bytes(path: str, size: tuple[int, int] = (150, 150)) -> io.BytesIO
 
 
 # =============================================================================
-# EXCEL EXPORT
+# EXCEL EXPORT  (also imported by byd_ads_app.py)
 # =============================================================================
 
-# Column definitions: (header, width)
-COLUMNS = [
+EXCEL_COLUMNS = [
     ("N°",                    5),
     ("ID Anuncio",           22),
     ("Texto del Anuncio",    65),
@@ -155,242 +146,173 @@ COLUMNS = [
     ("Vista Previa",         22),
 ]
 
-# BYD brand colors
-COLOR_HEADER_BG   = "1A1A2E"   # dark navy
-COLOR_HEADER_FG   = "FFFFFF"
-COLOR_RED         = "E31837"   # BYD red
-COLOR_ALT_ROW     = "F4F6F9"
-COLOR_BORDER      = "CCCCCC"
-
-_thin = Side(style="thin", color=COLOR_BORDER)
+_thin      = Side(style="thin", color=C_BORDER)
 BORDER_ALL = Border(left=_thin, right=_thin, top=_thin, bottom=_thin)
 
 
-def _header_style() -> tuple[Font, PatternFill, Alignment]:
-    return (
-        Font(bold=True, color=COLOR_HEADER_FG, size=10, name="Calibri"),
-        PatternFill("solid", fgColor=COLOR_HEADER_BG),
-        Alignment(horizontal="center", vertical="center", wrap_text=True),
-    )
-
-
 def create_excel(ads: list[dict], output_path: Path) -> str:
+    """Generate formatted Excel. Can be called from the Streamlit app too."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Anuncios BYD CR"
 
-    # ── Header row ────────────────────────────────────────────────────────────
-    hfont, hfill, halign = _header_style()
-    for col_idx, (title, width) in enumerate(COLUMNS, 1):
-        cell = ws.cell(row=1, column=col_idx, value=title)
-        cell.font   = hfont
-        cell.fill   = hfill
+    hfont  = Font(bold=True, color="FFFFFF", size=10, name="Calibri")
+    hfill  = PatternFill("solid", fgColor=C_NAVY)
+    halign = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    alt_f  = PatternFill("solid", fgColor=C_ALT)
+
+    for ci, (title, width) in enumerate(EXCEL_COLUMNS, 1):
+        cell = ws.cell(row=1, column=ci, value=title)
+        cell.font      = hfont
+        cell.fill      = hfill
         cell.alignment = halign
-        cell.border = BORDER_ALL
-        ws.column_dimensions[get_column_letter(col_idx)].width = width
+        cell.border    = BORDER_ALL
+        ws.column_dimensions[get_column_letter(ci)].width = width
     ws.row_dimensions[1].height = 28
     ws.freeze_panes = "A2"
 
-    # ── Data rows ─────────────────────────────────────────────────────────────
     for i, ad in enumerate(ads):
-        row = i + 2
-        alt = PatternFill("solid", fgColor=COLOR_ALT_ROW) if i % 2 == 0 else None
+        row  = i + 2
+        fill = alt_f if i % 2 == 0 else None
 
-        values = [
+        row_vals = [
             i + 1,
-            ad.get("ad_id", ""),
-            ad.get("body_text", ""),
-            ad.get("headline", ""),
+            ad.get("ad_id",       ""),
+            ad.get("body_text",   ""),
+            ad.get("headline",    ""),
             ad.get("description", ""),
-            ad.get("cta", ""),
-            ad.get("start_date", ""),
-            ad.get("status", "Activo"),
-            ad.get("platforms", "Facebook"),
+            ad.get("cta",         ""),
+            ad.get("start_date",  ""),
+            ad.get("status",      "Activo"),
+            ad.get("platforms",   "Facebook"),
             ad.get("impressions", ""),
-            ad.get("image_url", ""),
+            ad.get("image_url",   ""),
         ]
-
-        for col_idx, val in enumerate(values, 1):
-            cell = ws.cell(row=row, column=col_idx, value=val)
-            cell.border = BORDER_ALL
+        for ci, val in enumerate(row_vals, 1):
+            cell = ws.cell(row=row, column=ci, value=val)
+            cell.border    = BORDER_ALL
             cell.alignment = Alignment(vertical="top", wrap_text=True,
-                                       horizontal="center" if col_idx <= 2 else "left")
-            if alt:
-                cell.fill = alt
+                                       horizontal="center" if ci <= 2 else "left")
+            if fill:
+                cell.fill = fill
 
-        # Embed image thumbnail in column L (12)
         local_img = ad.get("local_image")
-        cell_ref  = f"L{row}"
         if local_img and os.path.exists(local_img):
             buf = thumbnail_bytes(local_img)
             if buf:
                 try:
-                    xl_img = XLImage(buf)
-                    xl_img.width  = 130
-                    xl_img.height = 130
-                    ws.add_image(xl_img, cell_ref)
+                    xi = XLImage(buf)
+                    xi.width, xi.height = 130, 130
+                    ws.add_image(xi, f"L{row}")
                     ws.row_dimensions[row].height = 100
-                except Exception as e:
-                    log(f"[excel] No se pudo insertar imagen fila {row}: {e}", 2)
-                    ws.row_dimensions[row].height = 55
-            else:
-                ws.row_dimensions[row].height = 55
-        else:
-            ws.row_dimensions[row].height = 55
+                    continue
+                except Exception:
+                    pass
+        ws.row_dimensions[row].height = 55
 
-    # ── Resumen sheet ─────────────────────────────────────────────────────────
+    # Resumen
     ws2 = wb.create_sheet("Resumen")
-    title_font = Font(bold=True, size=16, color=COLOR_RED, name="Calibri")
-    bold_font  = Font(bold=True, name="Calibri")
-
     ws2["A1"] = f"{PAGE_NAME} – Biblioteca de Anuncios Facebook"
-    ws2["A1"].font = title_font
+    ws2["A1"].font = Font(bold=True, size=16, color=C_RED)
     ws2.column_dimensions["A"].width = 38
-    ws2.column_dimensions["B"].width = 55
-
-    summary_rows = [
-        ("Total anuncios extraídos",  len(ads)),
-        ("Fecha de extracción",       datetime.now().strftime("%d/%m/%Y %H:%M")),
-        ("Page ID Facebook",          PAGE_ID),
-        ("País",                      "Costa Rica (CR)"),
-        ("URL fuente",                ADS_LIBRARY_URL),
-    ]
-    for r, (label, val) in enumerate(summary_rows, 3):
-        ws2[f"A{r}"] = label
-        ws2[f"A{r}"].font = bold_font
+    ws2.column_dimensions["B"].width = 60
+    bf = Font(bold=True)
+    for r, (lbl, val) in enumerate([
+        ("Total anuncios",      len(ads)),
+        ("Fecha extracción",    datetime.now().strftime("%d/%m/%Y %H:%M")),
+        ("Page ID",             PAGE_ID),
+        ("País",                "Costa Rica (CR)"),
+    ], 3):
+        ws2[f"A{r}"] = lbl; ws2[f"A{r}"].font = bf
         ws2[f"B{r}"] = str(val)
-
-    # ── Instructions sheet ────────────────────────────────────────────────────
-    ws3 = wb.create_sheet("Instrucciones")
-    ws3.column_dimensions["A"].width = 90
-    instructions = [
-        ("Guía de columnas del reporte", Font(bold=True, size=14, color=COLOR_RED)),
-        ("", None),
-        ("N°              → Número secuencial del anuncio", None),
-        ("ID Anuncio      → Identificador único del anuncio en Facebook", None),
-        ("Texto del Anuncio → Cuerpo/copy principal del anuncio", None),
-        ("Titular         → Titular o headline del anuncio", None),
-        ("Descripción     → Descripción adicional o subtítulo", None),
-        ("Call to Action  → Botón de acción del anuncio (Comprar, Ver más, etc.)", None),
-        ("Fecha Inicio    → Fecha en que el anuncio empezó a publicarse", None),
-        ("Estado          → Activo / Inactivo", None),
-        ("Plataformas     → Facebook, Instagram, Messenger, etc.", None),
-        ("Rango Impresiones → Estimado de impresiones (rango público de Facebook)", None),
-        ("URL Imagen      → Enlace directo a la imagen del anuncio", None),
-        ("Vista Previa    → Miniatura de la imagen incrustada en el Excel", None),
-    ]
-    for r, (text, font) in enumerate(instructions, 1):
-        ws3[f"A{r}"] = text
-        if font:
-            ws3[f"A{r}"].font = font
 
     wb.save(output_path)
     return str(output_path)
 
 
 # =============================================================================
-# PLAYWRIGHT HELPERS
+# PLAYWRIGHT – HELPERS
 # =============================================================================
 
-async def dismiss_cookies(page) -> None:
-    """Attempt to accept/dismiss any cookie or login dialog."""
-    selectors = [
+async def dismiss_overlay(page) -> None:
+    """Close cookies or login dialogs."""
+    for sel in [
         '[data-testid="cookie-policy-manage-dialog-accept-button"]',
         'button[title="Allow all cookies"]',
         'button[title="Aceptar todas las cookies"]',
         'button:has-text("Accept All")',
         'button:has-text("Accept all")',
         'button:has-text("Aceptar todo")',
-        'button:has-text("Allow essential and optional cookies")',
-    ]
-    for sel in selectors:
-        try:
-            btn = page.locator(sel).first
-            if await btn.is_visible(timeout=2500):
-                await btn.click()
-                log("✓ Diálogo de cookies cerrado", 1)
-                await asyncio.sleep(1.5)
-                return
-        except Exception:
-            continue
-
-
-async def dismiss_login_popup(page) -> None:
-    """Close Facebook login modal if it appears."""
-    close_sels = [
-        '[aria-label="Close"]',
-        '[aria-label="Cerrar"]',
-        'div[role="dialog"] [aria-label*="lose"]',
-    ]
-    for sel in close_sels:
+        '[aria-label="Close"]', '[aria-label="Cerrar"]',
+    ]:
         try:
             btn = page.locator(sel).first
             if await btn.is_visible(timeout=2000):
                 await btn.click()
-                log("✓ Pop-up de login cerrado", 1)
                 await asyncio.sleep(1)
                 return
         except Exception:
             continue
 
 
-# =============================================================================
-# AD EXTRACTION
-# =============================================================================
+# Image URLs we want to skip (icons, avatars, tiny sprites)
+_SKIP_IMG_RE = re.compile(
+    r"(emoji|icon|static|sprite|profile|avatar|1[0-9]x|2[0-4]x|"
+    r"32x32|48x48|favicon|svg\+xml)",
+    re.IGNORECASE,
+)
 
-_DATE_PATTERNS = [
-    r"Started running on\s+(.+?)(?:\n|$)",
-    r"Inició el\s+(.+?)(?:\n|$)",
-    r"Began running on\s+(.+?)(?:\n|$)",
-    r"(\d{1,2}\s+de\s+\w+\s+de\s+\d{4})",
-    r"(\w+ \d{1,2}, \d{4})",
-    r"(\d{1,2}/\d{1,2}/\d{4})",
+_DATE_RE = [
+    re.compile(r"Started running on\s+(.+?)(?:\n|$)", re.I),
+    re.compile(r"Inició el\s+(.+?)(?:\n|$)", re.I),
+    re.compile(r"Began running on\s+(.+?)(?:\n|$)", re.I),
+    re.compile(r"(\d{1,2}\s+de\s+\w+\s+de\s+\d{4})"),
+    re.compile(r"(\w+ \d{1,2}, \d{4})"),
+    re.compile(r"(\d{1,2}/\d{1,2}/\d{4})"),
 ]
 
-_CTA_KEYWORDS = [
+_IMP_RE = re.compile(r"[\d,.][\d,.]*\s*[-–—]\s*[\d,.][\d,.]+")
+
+_CTA_KW = [
     "Shop Now", "Learn More", "Sign Up", "Contact Us", "Book Now",
-    "Get Offer", "Watch More", "Apply Now", "Download",
+    "Get Offer", "Watch More", "Apply Now", "Download", "Get Quote",
     "Ver más", "Comprar ahora", "Registrarse", "Contactar",
-    "Obtener oferta", "Descargar", "Solicitar",
+    "Solicitar cotización", "Descargar",
 ]
 
 _PLATFORMS = ["Facebook", "Instagram", "Messenger", "Audience Network"]
 
-_IMPRESSION_RE = re.compile(r"[\d,.][\d,.]*\s*[-–—]\s*[\d,.][\d,.]+")
 
-
-def _parse_text_block(full_text: str) -> dict:
-    """Extract structured fields from raw ad text."""
-    lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
+def _parse_text(full: str) -> dict:
+    lines = [l.strip() for l in full.splitlines() if l.strip()]
     result: dict = {}
 
-    # Body text: longest paragraph-like line
-    candidates = [ln for ln in lines if len(ln) > 40]
-    result["body_text"] = candidates[0] if candidates else " | ".join(lines[:4])
+    # Body text: longest paragraph-ish line
+    cands = sorted([l for l in lines if len(l) > 30], key=len, reverse=True)
+    result["body_text"] = cands[0] if cands else " | ".join(lines[:3])
 
-    # Headline: often a short bold-ish line after the body
-    short = [ln for ln in lines if 5 < len(ln) <= 80 and ln not in candidates[:1]]
+    # Headline: a shorter distinct line
+    short = [l for l in lines if 6 < len(l) < 90 and l != result["body_text"]]
     result["headline"] = short[0] if short else ""
 
-    # Date
-    for pat in _DATE_PATTERNS:
-        m = re.search(pat, full_text, re.IGNORECASE)
+    # Description: second distinct short block
+    result["description"] = short[1] if len(short) > 1 else ""
+
+    for pat in _DATE_RE:
+        m = pat.search(full)
         if m:
             result["start_date"] = m.group(1).strip()
             break
 
-    # CTA
-    for kw in _CTA_KEYWORDS:
-        if kw.lower() in full_text.lower():
+    for kw in _CTA_KW:
+        if kw.lower() in full.lower():
             result["cta"] = kw
             break
 
-    # Platforms
-    found_platforms = [p for p in _PLATFORMS if p.lower() in full_text.lower()]
-    result["platforms"] = ", ".join(found_platforms) if found_platforms else "Facebook"
+    plats = [p for p in _PLATFORMS if p.lower() in full.lower()]
+    result["platforms"] = ", ".join(plats) if plats else "Facebook"
 
-    # Impressions
-    m = _IMPRESSION_RE.search(full_text)
+    m = _IMP_RE.search(full)
     if m:
         result["impressions"] = m.group(0).strip()
 
@@ -398,92 +320,105 @@ def _parse_text_block(full_text: str) -> dict:
 
 
 async def extract_ad(card) -> dict:
-    """Extract all data from a single ad card element."""
     ad: dict = {}
     try:
         full_text = await card.inner_text()
-        ad.update(_parse_text_block(full_text))
+        ad.update(_parse_text(full_text))
 
-        # Ad ID
+        # Ad ID from data attributes or aria labels
         for attr in ("data-ad-id", "id"):
             try:
-                val = await card.get_attribute(attr)
-                if val and val.isdigit():
-                    ad["ad_id"] = val
+                v = await card.get_attribute(attr)
+                if v and re.match(r"^\d{10,}$", v.strip()):
+                    ad["ad_id"] = v.strip()
                     break
             except Exception:
                 pass
 
-        # Images  – prefer large src, skip tiny icons
+        # ── Images ────────────────────────────────────────────────────────────
         img_urls: list[str] = []
+
+        # 1. All <img src> that look like real content images
         try:
             imgs = await card.query_selector_all("img[src]")
             for img in imgs:
                 src = await img.get_attribute("src") or ""
-                if src.startswith("http") and not re.search(
-                    r"(emoji|icon|1[0-9]x|2[0-4]x|profile)", src, re.I
-                ):
+                if src.startswith("http") and not _SKIP_IMG_RE.search(src):
                     img_urls.append(src)
         except Exception:
             pass
 
-        # Also capture background-image CSS
+        # 2. CSS background-image
         try:
-            bg_elems = await card.query_selector_all("[style*='background-image']")
-            for elem in bg_elems:
+            for elem in await card.query_selector_all("[style*='background-image']"):
                 style = await elem.get_attribute("style") or ""
-                for url in re.findall(r'url\(["\']?(https[^"\')\s]+)["\']?\)', style):
-                    if url not in img_urls:
-                        img_urls.append(url)
+                for u in re.findall(r'url\(["\']?(https[^"\')\s]+)["\']?\)', style):
+                    if u not in img_urls and not _SKIP_IMG_RE.search(u):
+                        img_urls.append(u)
         except Exception:
             pass
 
-        if img_urls:
-            ad["image_url"]       = img_urls[0]
-            ad["all_image_urls"]  = "; ".join(img_urls)
+        # 3. <source srcset> inside <picture> or <video poster>
+        try:
+            for elem in await card.query_selector_all("source[srcset], video[poster]"):
+                val = (await elem.get_attribute("srcset") or
+                       await elem.get_attribute("poster") or "")
+                for u in re.findall(r"(https\S+)", val):
+                    if u not in img_urls and not _SKIP_IMG_RE.search(u):
+                        img_urls.append(u)
+        except Exception:
+            pass
 
-    except Exception as exc:
-        log(f"[extract] Error: {exc}", 2)
+        # Prefer largest-looking URL (often has width/height hints)
+        def _img_score(u: str) -> int:
+            nums = re.findall(r"[_\-](\d{3,4})[_x\-]", u)
+            return max((int(n) for n in nums), default=0)
+
+        img_urls.sort(key=_img_score, reverse=True)
+
+        if img_urls:
+            ad["image_url"]      = img_urls[0]
+            ad["all_image_urls"] = img_urls[:5]  # keep up to 5
+
+    except Exception as e:
+        log(f"[extract] {e}", 3)
 
     return ad
 
 
-# Selectors to find individual ad cards on the page
-_AD_CARD_SELECTORS = [
+# Facebook Ads Library – multiple selector strategies for the ad cards
+_CARD_SELECTORS = [
     '[data-testid="ad-archive-preview"]',
     'div._8nqq',
-    'div[class*="x1n2onr6"][class*="x1ja2u2z"]',
     '._99s5',
+    'div[class*="x1yztbdb"][class*="xn6708d"]',
 ]
 
 
-async def find_ad_cards(page):
-    """Try multiple selectors to locate ad cards."""
-    for sel in _AD_CARD_SELECTORS:
+async def find_cards(page):
+    for sel in _CARD_SELECTORS:
         try:
             cards = await page.query_selector_all(sel)
             if cards:
                 return cards
         except Exception:
             continue
-
-    # Fallback: JS-based heuristic (find divs that look like ad cards)
+    # JS heuristic: walk up from images to find ad card containers
     try:
         cards = await page.evaluate("""
             () => {
-                const seen   = new Set();
-                const result = [];
+                const seen = new Set(), result = [];
                 for (const img of document.images) {
-                    // Walk up to a container that has "Ad ID" or date text nearby
                     let el = img.parentElement;
-                    for (let i = 0; i < 8; i++) {
+                    for (let i = 0; i < 10; i++) {
                         if (!el) break;
-                        const txt = el.innerText || "";
+                        const t = el.innerText || "";
                         if (
-                            (txt.includes("Ad ID") || txt.includes("ID del anuncio") ||
-                             txt.includes("Started running") || txt.includes("Inició"))
+                            (t.includes("Ad ID") || t.includes("ID del anuncio") ||
+                             t.includes("Started running") || t.includes("Inició"))
                             && el.querySelectorAll("img").length >= 1
                             && !seen.has(el)
+                            && el.getBoundingClientRect().height > 200
                         ) {
                             seen.add(el);
                             result.push(el);
@@ -499,7 +434,6 @@ async def find_ad_cards(page):
             return cards
     except Exception:
         pass
-
     return []
 
 
@@ -508,109 +442,102 @@ async def find_ad_cards(page):
 # =============================================================================
 
 async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
-    setup_dirs()
-
+    setup()
     log("")
-    log("=" * 62)
+    log("=" * 64)
     log("  BYD Costa Rica – Facebook Ads Library Scraper")
-    log("=" * 62)
+    log("=" * 64)
     log(f"  Máx. anuncios : {max_ads}")
-    log(f"  Modo          : {'headless' if headless else 'visible (navegador abierto)'}")
+    log(f"  Modo          : {'headless' if headless else 'visible'}")
     log(f"  Salida        : {output_path}")
-    log("=" * 62)
-    log("")
+    log("=" * 64)
 
-    ads_collected: list[dict] = []
-    seen_ids: set[str] = set()
+    collected: list[dict] = []
+    seen: set[str] = set()
 
     async with async_playwright() as pw:
-        log("Iniciando navegador Chromium...", 1)
         browser = await pw.chromium.launch(
             headless=headless,
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-blink-features=AutomationControlled",
-                "--disable-infobars",
-            ],
+            args=["--no-sandbox", "--disable-setuid-sandbox",
+                  "--disable-blink-features=AutomationControlled"],
         )
         ctx = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 900},
+            user_agent=UA,
+            viewport={"width": 1440, "height": 900},
             locale="es-CR",
             timezone_id="America/Costa_Rica",
         )
-        # Block fonts/icons to speed things up
-        await ctx.route(
-            "**/*.{woff,woff2,ttf,otf}",
-            lambda route, _req: route.abort(),
-        )
+        await ctx.route("**/*.{woff,woff2,ttf,otf}",
+                        lambda r, _: r.abort())
 
         page = await ctx.new_page()
 
-        log("Navegando a Facebook Ads Library...", 1)
+        log("Navegando a Facebook Ads Library…", 1)
         try:
-            await page.goto(ADS_LIBRARY_URL, wait_until="domcontentloaded",
+            await page.goto(ADS_LIBRARY_URL,
+                            wait_until="domcontentloaded",
                             timeout=LOAD_TIMEOUT_MS)
         except Exception as e:
-            log(f"⚠  Timeout en carga inicial (continuando): {e}", 2)
+            log(f"⚠  Timeout inicial (continuando): {e}", 2)
 
-        await asyncio.sleep(3)
-        await dismiss_cookies(page)
-        await dismiss_login_popup(page)
+        await asyncio.sleep(4)
+        await dismiss_overlay(page)
+        await asyncio.sleep(4)
 
-        log("Esperando que aparezcan los anuncios...", 1)
-        await asyncio.sleep(5)
-
-        processed_count = 0
+        processed = 0
         no_change = 0
         scroll_n  = 0
 
-        while len(ads_collected) < max_ads and no_change < NO_CHANGE_LIMIT:
-            cards = await find_ad_cards(page)
-            log(f"Scroll {scroll_n + 1:>3} → {len(cards)} tarjetas en DOM", 1)
+        while len(collected) < max_ads and no_change < NO_CHANGE_LIMIT:
+            cards = await find_cards(page)
+            log(f"Scroll {scroll_n + 1:>3}  │  {len(cards)} tarjetas en DOM  │  "
+                f"{len(collected)} extraídos", 1)
 
-            new_found = 0
-            for card in cards[processed_count:]:
-                if len(ads_collected) >= max_ads:
+            new = 0
+            for card in cards[processed:]:
+                if len(collected) >= max_ads:
                     break
                 try:
                     ad = await extract_ad(card)
                     if not ad:
                         continue
 
-                    # Deduplicate by ad_id or body fingerprint
-                    key = ad.get("ad_id") or ad.get("body_text", "")[:80]
-                    if key in seen_ids:
+                    key = ad.get("ad_id") or ad.get("body_text", "")[:100]
+                    if key in seen:
                         continue
-                    seen_ids.add(key)
+                    seen.add(key)
 
-                    # Download image
+                    # Download best image
                     if ad.get("image_url"):
-                        stem = f"ad_{len(ads_collected):04d}"
+                        stem = f"ad_{len(collected):04d}"
                         ad["local_image"] = download_image(ad["image_url"], stem)
 
-                    ads_collected.append(ad)
-                    new_found += 1
-                    body_preview = str(ad.get("body_text", ""))[:65]
-                    log(f"✓ #{len(ads_collected):>3}  {body_preview}…", 2)
+                    # Add metadata
+                    ad["scraped_at"] = datetime.now().isoformat()
+                    ad["status"]     = ad.get("status", "Activo")
 
-                except Exception as exc:
-                    log(f"✗ Error en tarjeta: {exc}", 2)
+                    collected.append(ad)
+                    new += 1
+                    preview = str(ad.get("body_text", ""))[:60]
+                    log(f"✓ #{len(collected):>3}  {preview}…", 2)
 
-            processed_count = len(cards)
-            no_change = 0 if new_found > 0 else no_change + 1
+                except Exception as e:
+                    log(f"✗ {e}", 2)
 
-            # Scroll down to load more
-            await page.evaluate("window.scrollBy(0, 1400)")
+            processed  = len(cards)
+            no_change  = 0 if new > 0 else no_change + 1
+
+            # Scroll
+            await page.evaluate("window.scrollBy(0, 1500)")
             await asyncio.sleep(SCROLL_PAUSE_SEC)
             scroll_n += 1
 
-            # Try clicking any "See more" / "Ver más" load-more button
-            for btn_text in ["See more results", "Ver más resultados", "Load more"]:
+            # "Load more" button
+            for txt in ["See more results", "Ver más resultados"]:
                 try:
-                    btn = page.locator(f'div[role="button"]:has-text("{btn_text}")').first
-                    if await btn.is_visible(timeout=800):
+                    btn = page.locator(
+                        f'div[role="button"]:has-text("{txt}")').first
+                    if await btn.is_visible(timeout=600):
                         await btn.click()
                         await asyncio.sleep(2)
                 except Exception:
@@ -618,72 +545,57 @@ async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
 
         await browser.close()
 
-    return ads_collected
+    return collected
 
 
 # =============================================================================
 # ENTRY POINT
 # =============================================================================
 
-def parse_args() -> argparse.Namespace:
+def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="BYD Costa Rica – Scraper de Biblioteca de Anuncios de Facebook"
-    )
-    p.add_argument("--max",      type=int,  default=MAX_ADS_DEFAULT,
-                   help=f"Máximo de anuncios a extraer (default: {MAX_ADS_DEFAULT})")
-    p.add_argument("--visible",  action="store_true",
-                   help="Abrir navegador visible (útil para debug)")
-    p.add_argument("--output",   type=str,  default=None,
-                   help="Nombre del archivo Excel de salida")
+        description="BYD Costa Rica – scraper de la Biblioteca de Anuncios")
+    p.add_argument("--max",     type=int, default=MAX_ADS_DEFAULT)
+    p.add_argument("--visible", action="store_true")
+    p.add_argument("--output",  type=str, default=None)
     return p.parse_args()
 
 
 def main() -> None:
-    args = parse_args()
+    args      = _parse_args()
+    headless  = not args.visible
+    ts        = datetime.now().strftime("%Y%m%d_%H%M")
+    out_path  = Path(args.output) if args.output else \
+                OUTPUT_DIR / f"BYD_CR_Ads_{ts}.xlsx"
 
-    headless = not args.visible
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    output_path = Path(args.output) if args.output else \
-        OUTPUT_DIR / f"BYD_CR_Ads_{timestamp}.xlsx"
+    ads = asyncio.run(scrape(args.max, headless, out_path))
 
-    # Run async scraper
-    ads = asyncio.run(scrape(
-        max_ads=args.max,
-        headless=headless,
-        output_path=output_path,
-    ))
-
-    log("")
-    log(f"Total anuncios extraídos : {len(ads)}", 1)
+    log(f"\n  Total extraídos: {len(ads)}", 0)
 
     if not ads:
-        log("", 0)
-        log("⚠  No se encontraron anuncios. Posibles causas:", 1)
-        log("   1. Facebook requiere login para este contenido", 2)
-        log("   2. Los selectores CSS de Facebook han cambiado", 2)
-        log("   3. La página tiene protección anti-bot activa", 2)
-        log("", 0)
-        log("Sugerencia: prueba con --visible para ver qué pasa en el navegador.", 1)
+        log("⚠  Sin anuncios. Prueba --visible para ver qué ocurre.", 1)
         sys.exit(1)
 
-    log("Generando archivo Excel...", 1)
-    excel_file = create_excel(ads, output_path)
+    log("Generando Excel…", 1)
+    excel_path = create_excel(ads, out_path)
 
-    # JSON backup
-    json_path = OUTPUT_DIR / f"ads_raw_{datetime.now().strftime('%Y%m%d_%H%M')}.json"
-    clean_ads = [{k: v for k, v in ad.items() if k != "local_image"} for ad in ads]
+    json_path = OUTPUT_DIR / f"ads_raw_{ts}.json"
+    clean = [{k: v for k, v in a.items() if k != "local_image"} for a in ads]
+    # Save local_image paths too so the Streamlit app can load them
+    for a_clean, a_full in zip(clean, ads):
+        if a_full.get("local_image"):
+            a_clean["local_image"] = a_full["local_image"]
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(clean_ads, f, ensure_ascii=False, indent=2)
+        json.dump(clean, f, ensure_ascii=False, indent=2)
 
     log("")
-    log("=" * 62)
+    log("=" * 64)
     log("  ✅  COMPLETADO")
-    log("=" * 62)
-    log(f"  Excel    : {excel_file}", 1)
+    log("=" * 64)
+    log(f"  Excel    : {excel_path}", 1)
     log(f"  JSON     : {json_path}", 1)
     log(f"  Imágenes : {IMAGES_DIR}", 1)
-    log("=" * 62)
-    log("")
+    log("=" * 64)
 
 
 if __name__ == "__main__":
