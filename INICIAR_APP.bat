@@ -1,53 +1,68 @@
 @echo off
-title BYD Ads Intelligence - Instalando y lanzando...
+title BYD Ads Scraper
 color 0A
+cd /d "%~dp0"
 
 echo.
-echo  ██████╗ ██╗   ██╗██████╗
-echo  ██╔══██╗╚██╗ ██╔╝██╔══██╗
-echo  ██████╔╝ ╚████╔╝ ██║  ██║
-echo  ██╔══██╗  ╚██╔╝  ██║  ██║
-echo  ██████╔╝   ██║   ██████╔╝
-echo  ╚═════╝    ╚═╝   ╚═════╝
-echo.
-echo  BYD Costa Rica - Ads Intelligence
-echo  ====================================
+echo  ============================================
+echo   BYD Costa Rica - Facebook Ads Scraper
+echo  ============================================
 echo.
 
-:: Verificar Python
+:: ── 1. Verificar Python ───────────────────────────────────────────────────
 python --version >nul 2>&1
 if errorlevel 1 (
     echo  [ERROR] Python no esta instalado.
     echo.
     echo  Descargalo de: https://python.org/downloads
-    echo  Asegurate de marcar "Add Python to PATH"
+    echo  Marca "Add Python to PATH" durante la instalacion.
     echo.
     pause
     exit /b 1
 )
+for /f "tokens=*" %%i in ('python --version 2^>^&1') do echo  Python: %%i
 
-echo  [1/3] Python encontrado. Instalando dependencias...
+:: ── 2. Instalar dependencias ──────────────────────────────────────────────
 echo.
-pip install streamlit plotly pandas pillow openpyxl requests --quiet
-
+echo  [1/3] Instalando dependencias de Python...
+pip install playwright openpyxl pillow requests --quiet --disable-pip-version-check
 if errorlevel 1 (
-    echo.
-    echo  [ERROR] Fallo la instalacion. Intenta correr como Administrador.
+    echo  [ERROR] Fallo pip install. Corre este .bat como Administrador.
     pause
     exit /b 1
 )
+echo        OK
+
+:: ── 3. Instalar Chromium (navegador headless) ─────────────────────────────
+echo.
+echo  [2/3] Instalando navegador Chromium (solo la primera vez, ~150 MB)...
+python -m playwright install chromium --with-deps >nul 2>&1
+if errorlevel 1 (
+    python -m playwright install chromium
+)
+echo        OK
+
+:: ── 4. Correr el scraper ──────────────────────────────────────────────────
+echo.
+echo  [3/3] Iniciando scraper de BYD Costa Rica...
+echo.
+echo  Se abrira un navegador invisible que recorre la Biblioteca de Anuncios.
+echo  Al terminar encontraras el Excel en la carpeta byd_ads_output\
+echo.
+echo  ============================================
+echo.
+
+python byd_scraper.py %*
 
 echo.
-echo  [2/3] Dependencias instaladas OK.
-echo.
-echo  [3/3] Lanzando la app en http://localhost:8501 ...
-echo.
-echo  (Cierra esta ventana para detener la app)
+echo  ============================================
+echo   Listo! Abre la carpeta byd_ads_output\
+echo  ============================================
 echo.
 
-:: Ir al directorio donde esta este .bat
-cd /d "%~dp0"
-
-streamlit run byd_ads_app.py --server.enableCORS false --server.enableXsrfProtection false
+:: Abrir carpeta con el resultado
+if exist byd_ads_output (
+    explorer byd_ads_output
+)
 
 pause
