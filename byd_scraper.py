@@ -61,10 +61,11 @@ ADS_LIBRARY_URL = (
 
 OUTPUT_DIR       = Path("byd_ads_output")
 IMAGES_DIR       = OUTPUT_DIR / "images"
-SCROLL_PAUSE_SEC = 3.0
-LOAD_TIMEOUT_MS  = 45_000
-NO_CHANGE_LIMIT  = 7
+SCROLL_PAUSE_SEC = 4.0
+LOAD_TIMEOUT_MS  = 60_000
+NO_CHANGE_LIMIT  = 8
 MAX_ADS_DEFAULT  = 300
+DEBUG_SCREENSHOTS = True   # save PNG snapshots to byd_ads_output/ for debugging
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -236,24 +237,54 @@ def create_excel(ads: list[dict], output_path: Path) -> str:
 # =============================================================================
 
 async def dismiss_overlay(page) -> None:
-    """Close cookies or login dialogs."""
-    for sel in [
+    """Close cookies or login dialogs - tries many known Facebook selectors."""
+    selectors = [
         '[data-testid="cookie-policy-manage-dialog-accept-button"]',
         'button[title="Allow all cookies"]',
         'button[title="Aceptar todas las cookies"]',
+        'button[title="Accept all"]',
         'button:has-text("Accept All")',
         'button:has-text("Accept all")',
         'button:has-text("Aceptar todo")',
-        '[aria-label="Close"]', '[aria-label="Cerrar"]',
-    ]:
+        'button:has-text("Allow all cookies")',
+        'button:has-text("Allow Essential and Optional Cookies")',
+        'button:has-text("Permettre tous les cookies")',
+        '[data-cookiebanner="accept_button"]',
+        '[data-testid="accept-btn"]',
+        '[aria-label="Close"]',
+        '[aria-label="Cerrar"]',
+        'div[data-nosnippet] button',
+    ]
+    for sel in selectors:
         try:
             btn = page.locator(sel).first
-            if await btn.is_visible(timeout=2000):
+            if await btn.is_visible(timeout=1500):
                 await btn.click()
-                await asyncio.sleep(1)
-                return
+                log(f"  [overlay] Dismissed via: {sel}", 2)
+                await asyncio.sleep(1.5)
         except Exception:
             continue
+
+
+async def _screenshot(page, name: str) -> None:
+    if not DEBUG_SCREENSHOTS:
+        return
+    try:
+        p = OUTPUT_DIR / f"{name}.png"
+        await page.screenshot(path=str(p), full_page=False)
+        log(f"  [debug] Screenshot → {p}", 2)
+    except Exception:
+        pass
+
+
+async def _dump_html(page) -> None:
+    try:
+        html = await page.content()
+        p = OUTPUT_DIR / "debug_page.html"
+        p.write_text(html, encoding="utf-8")
+        log(f"  [debug] HTML ({len(html)//1024} kB) → {p}", 2)
+    except Exception:
+        pass
 
 
 # Image URLs we want to skip (icons, avatars, tiny sprites)
@@ -387,55 +418,125 @@ async def extract_ad(card) -> dict:
     return ad
 
 
-# Facebook Ads Library – multiple selector strategies for the ad cards
+# Facebook Ads Library – CSS selector strategies (kept as fast first pass)
 _CARD_SELECTORS = [
     '[data-testid="ad-archive-preview"]',
     'div._8nqq',
     '._99s5',
     'div[class*="x1yztbdb"][class*="xn6708d"]',
+    # 2024-2025 observed classes
+    'div[class*="xh8yej3"]',
+    'div[class*="x1n2onr6"][class*="x1ja2u2z"]',
 ]
+
+# Text markers that appear inside every Facebook Ads Library ad card
+_AD_TEXT_MARKERS = [
+    "ID de la biblioteca",
+    "Library ID",
+    "Started running",
+    "Inició",
+    "Began running",
+    "Se está publicando",
+    "Active",
+    "Activo",
+    "Paused",
+]
+
+_JS_FIND_CARDS = """
+() => {
+    const MARKERS = [
+        "ID de la biblioteca", "Library ID",
+        "Started running", "Inició", "Began running",
+        "Se está publicando", "En pausa"
+    ];
+    const seen = new WeakSet();
+    const results = [];
+
+    // Walk every text node; when we find a marker, walk up to find the card
+    const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+        const txt = node.textContent.trim();
+        if (!MARKERS.some(m => txt.includes(m))) continue;
+
+        // Walk ancestors to find the card container
+        let el = node.parentElement;
+        for (let i = 0; i < 20; i++) {
+            if (!el || el === document.body) break;
+            const rect = el.getBoundingClientRect();
+            if (rect.height > 250 && rect.width > 350 && !seen.has(el)) {
+                seen.add(el);
+                results.push(el);
+                break;
+            }
+            el = el.parentElement;
+        }
+    }
+    return results;
+}
+"""
+
+_JS_COUNT_MARKERS = """
+() => {
+    const MARKERS = [
+        "ID de la biblioteca", "Library ID",
+        "Started running", "Inició", "Began running"
+    ];
+    let count = 0;
+    const walker = document.createTreeWalker(
+        document.body, NodeFilter.SHOW_TEXT, null
+    );
+    let node;
+    while ((node = walker.nextNode())) {
+        if (MARKERS.some(m => node.textContent.includes(m))) count++;
+    }
+    return count;
+}
+"""
 
 
 async def find_cards(page):
+    # 1. Fast CSS selector pass
     for sel in _CARD_SELECTORS:
         try:
             cards = await page.query_selector_all(sel)
             if cards:
+                log(f"  [cards] CSS selector matched ({sel}): {len(cards)}", 2)
                 return cards
         except Exception:
             continue
-    # JS heuristic: walk up from images to find ad card containers
+
+    # 2. Text-content heuristic (works regardless of class obfuscation)
     try:
-        cards = await page.evaluate("""
-            () => {
-                const seen = new Set(), result = [];
-                for (const img of document.images) {
-                    let el = img.parentElement;
-                    for (let i = 0; i < 10; i++) {
-                        if (!el) break;
-                        const t = el.innerText || "";
-                        if (
-                            (t.includes("Ad ID") || t.includes("ID del anuncio") ||
-                             t.includes("Started running") || t.includes("Inició"))
-                            && el.querySelectorAll("img").length >= 1
-                            && !seen.has(el)
-                            && el.getBoundingClientRect().height > 200
-                        ) {
-                            seen.add(el);
-                            result.push(el);
-                            break;
-                        }
-                        el = el.parentElement;
-                    }
-                }
-                return result;
-            }
-        """)
+        cards = await page.evaluate(_JS_FIND_CARDS)
         if cards:
+            log(f"  [cards] JS text-heuristic: {len(cards)} cards", 2)
             return cards
-    except Exception:
-        pass
+    except Exception as e:
+        log(f"  [cards] JS heuristic error: {e}", 2)
+
     return []
+
+
+async def page_info(page) -> dict:
+    """Return diagnostic info about the current page state."""
+    try:
+        title = await page.title()
+        url   = page.url
+        h1s   = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('h1,h2')).map(e=>e.innerText).slice(0,5)"
+        )
+        marker_count = await page.evaluate(_JS_COUNT_MARKERS)
+        total_text   = await page.evaluate("() => document.body.innerText.length")
+        return {
+            "title": title, "url": url,
+            "h1s": h1s, "marker_count": marker_count,
+            "total_text_chars": total_text,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # =============================================================================
@@ -482,9 +583,38 @@ async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
         except Exception as e:
             log(f"⚠  Timeout inicial (continuando): {e}", 2)
 
-        await asyncio.sleep(4)
+        # ── Initial load: wait generously, JS-heavy page ──────────────────────
+        log("Esperando carga inicial (12 s)…", 1)
+        await asyncio.sleep(12)
+        await _screenshot(page, "debug_01_initial")
+
+        info = await page_info(page)
+        log(f"Página cargada: {info.get('title','?')!r}", 1)
+        log(f"  URL: {info.get('url','?')}", 2)
+        log(f"  Marcadores de anuncio detectados: {info.get('marker_count', 0)}", 2)
+        log(f"  Texto total: {info.get('total_text_chars', 0):,} chars", 2)
+        if info.get("h1s"):
+            log(f"  Encabezados: {info['h1s']}", 2)
+
+        # ── Dismiss cookie / login overlays ───────────────────────────────────
         await dismiss_overlay(page)
+        await asyncio.sleep(3)
+        await dismiss_overlay(page)   # second pass in case of stacked dialogs
+        await asyncio.sleep(5)
+        await _screenshot(page, "debug_02_after_cookie")
+
+        info2 = await page_info(page)
+        log(f"Post-overlay: marcadores={info2.get('marker_count',0)}", 1)
+
+        # ── If page is blank / login wall, dump HTML for diagnosis ────────────
+        if info2.get("total_text_chars", 0) < 5000 or info2.get("marker_count", 0) == 0:
+            log("⚠  Pocos datos en página – guardando HTML para diagnóstico", 1)
+            await _dump_html(page)
+
+        # ── Scroll down once to trigger lazy-load ─────────────────────────────
+        await page.evaluate("window.scrollBy(0, 800)")
         await asyncio.sleep(4)
+        await _screenshot(page, "debug_03_after_scroll1")
 
         processed = 0
         no_change = 0
@@ -492,8 +622,9 @@ async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
 
         while len(collected) < max_ads and no_change < NO_CHANGE_LIMIT:
             cards = await find_cards(page)
-            log(f"Scroll {scroll_n + 1:>3}  │  {len(cards)} tarjetas en DOM  │  "
-                f"{len(collected)} extraídos", 1)
+            marker_n = await page.evaluate(_JS_COUNT_MARKERS)
+            log(f"Scroll {scroll_n + 1:>3}  │  {len(cards)} tarjetas  │  "
+                f"marcadores={marker_n}  │  {len(collected)} extraídos", 1)
 
             new = 0
             for card in cards[processed:]:
@@ -505,7 +636,7 @@ async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
                         continue
 
                     key = ad.get("ad_id") or ad.get("body_text", "")[:100]
-                    if key in seen:
+                    if not key or key in seen:
                         continue
                     seen.add(key)
 
@@ -514,7 +645,6 @@ async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
                         stem = f"ad_{len(collected):04d}"
                         ad["local_image"] = download_image(ad["image_url"], stem)
 
-                    # Add metadata
                     ad["scraped_at"] = datetime.now().isoformat()
                     ad["status"]     = ad.get("status", "Activo")
 
@@ -530,21 +660,23 @@ async def scrape(max_ads: int, headless: bool, output_path: Path) -> list[dict]:
             no_change  = 0 if new > 0 else no_change + 1
 
             # Scroll
-            await page.evaluate("window.scrollBy(0, 1500)")
+            await page.evaluate("window.scrollBy(0, 1800)")
             await asyncio.sleep(SCROLL_PAUSE_SEC)
             scroll_n += 1
 
             # "Load more" button
-            for txt in ["See more results", "Ver más resultados"]:
+            for txt in ["See more results", "Ver más resultados", "Ver más"]:
                 try:
                     btn = page.locator(
                         f'div[role="button"]:has-text("{txt}")').first
-                    if await btn.is_visible(timeout=600):
+                    if await btn.is_visible(timeout=500):
                         await btn.click()
-                        await asyncio.sleep(2)
+                        await asyncio.sleep(2.5)
                 except Exception:
                     pass
 
+        # Final screenshot for reference
+        await _screenshot(page, "debug_final")
         await browser.close()
 
     return collected
